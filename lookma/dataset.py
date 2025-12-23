@@ -1,0 +1,174 @@
+import torch
+from torch.utils.data import Dataset
+import json
+import os
+import cv2
+import numpy as np
+import glob
+
+
+class SynthBodyDataset(Dataset):
+    def __init__(self, root_dir, specific_image=None, target_size=256, is_train=True):
+        self.root_dir = root_dir
+        self.target_size = target_size
+        self.is_train = is_train  # Turns augmentation on/off
+
+        print(f"Scanning {root_dir} for metadata files...")
+        if specific_image:
+            target_meta = (
+                specific_image.replace("img_", "metadata_")
+                .replace(".jpg", ".json")
+                .replace(".png", ".json")
+            )
+            self.json_paths = [os.path.join(root_dir, target_meta)]
+        else:
+            self.json_paths = sorted(
+                glob.glob(os.path.join(root_dir, "metadata_*.json"))
+            )
+
+    def __len__(self):
+        return len(self.json_paths)
+
+    def get_aug_params(self, base_size):
+        # Default: Perfect Center, 1.0 Scale, 0 Rotation
+        rot = 0
+        scale = 1.0
+        shift_x = 0.0
+        shift_y = 0.0
+
+        if self.is_train:
+            # Rotation: +/- 30 degrees (60% chance)
+            # if np.random.rand() < 0.6:
+            #     rot_factor = 30
+            #     rot = np.clip(
+            #         np.random.randn() * rot_factor, -2 * rot_factor, 2 * rot_factor
+            #     )
+            rot = 0
+
+            # Scale: 0.8x (Zoom In) to 1.2x (Zoom Out)
+            # Zooming in simulates "Waist Up" shots (legs get cut off)
+            scale_factor = 0.4
+            scale = 1.0 + (np.random.rand() - 0.5) * 2 * scale_factor
+
+            # Shift: Move center +/- 10%
+            shift_factor = 0.1
+            shift_x = (np.random.rand() - 0.5) * 2 * shift_factor
+            shift_y = (np.random.rand() - 0.5) * 2 * shift_factor
+
+        return rot, scale, shift_x, shift_y
+
+    def __getitem__(self, idx):
+        try:
+            json_path = self.json_paths[idx]
+            with open(json_path, "r") as f:
+                meta = json.load(f)
+
+            base_name = (
+                os.path.basename(json_path)
+                .replace("metadata_", "img_")
+                .replace(".json", ".jpg")
+            )
+            img_path = os.path.join(self.root_dir, base_name)
+
+            image = cv2.imread(img_path)
+            if image is None:
+                raise FileNotFoundError
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+
+            # Raw Labels
+            cam_intrinsics = np.array(
+                meta["camera"]["camera_to_image"], dtype=np.float32
+            )
+            cam_extrinsics = torch.tensor(
+                meta["camera"]["world_to_camera"], dtype=torch.float32
+            )
+            pose = torch.tensor(meta["pose"], dtype=torch.float32).flatten()
+            betas = torch.tensor(meta["body_identity"], dtype=torch.float32)
+            trans = torch.tensor(meta["translation"], dtype=torch.float32)
+            landmarks_2d = np.array(meta["landmarks"]["2D"], dtype=np.float32)
+
+            # --- 1. CALCULATE CROP BOX ---
+            min_x, max_x = np.min(landmarks_2d[:, 0]), np.max(landmarks_2d[:, 0])
+            min_y, max_y = np.min(landmarks_2d[:, 1]), np.max(landmarks_2d[:, 1])
+            center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+
+            width = max_x - min_x
+            height = max_y - min_y
+            base_size = max(width, height) * 1.2  # 1.2x padding standard
+
+            # --- 2. AUGMENTATION CALCS ---
+            rot, scale_aug, shift_x, shift_y = self.get_aug_params(base_size)
+
+            # Apply shifts to center
+            # Note: We shift the center relative to the size of the person
+            center_x += base_size * shift_x
+            center_y += base_size * shift_y
+
+            # Apply scale to size
+            # Note: We invert scale here.
+            # If scale_aug = 1.2 (Zoom Out), the crop box must get BIGGER.
+            # If scale_aug = 0.8 (Zoom In), the crop box must get SMALLER.
+            proc_size = base_size / scale_aug
+
+            # --- 3. AFFINE TRANSFORM ---
+            # Define destination dimensions
+            dst_size = self.target_size
+            dst_center = dst_size / 2.0
+
+            # Calculate the Scale Ratio (Output / Input)
+            # This variable is needed for both Matrix M and updating Intrinsics later
+            scale_ratio = dst_size / proc_size
+
+            # 1. Create Rotation/Scale matrix centered on the PERSON
+            # getRotationMatrix2D handles rotation around a point AND scaling
+            M = cv2.getRotationMatrix2D((center_x, center_y), rot, scale_ratio)
+
+            # 2. Adjust Translation to center the result in the OUTPUT image
+            # We shift the matrix so the person moves from 'center_x' to 'dst_center'
+            M[0, 2] += dst_center - center_x
+            M[1, 2] += dst_center - center_y
+
+            # Warp Image
+            crop_image = cv2.warpAffine(
+                image,
+                M,
+                (dst_size, dst_size),
+                flags=cv2.INTER_LINEAR,
+                borderValue=(0, 0, 0),
+            )
+
+            # Warp Landmarks (Apply same M)
+            ones = np.ones((landmarks_2d.shape[0], 1))
+            landmarks_homo = np.hstack([landmarks_2d, ones])
+            landmarks_2d_new = np.dot(M, landmarks_homo.T).T
+
+            # --- 4. UPDATE INTRINSICS (K) ---
+            # scale_ratio is now correctly defined above
+            new_intrinsics = cam_intrinsics.copy()
+            new_intrinsics[0, 0] *= scale_ratio  # fx
+            new_intrinsics[1, 1] *= scale_ratio  # fy
+
+            # Update principal point
+            # Start with old center in homogenous coords
+            old_center = np.array([cam_intrinsics[0, 2], cam_intrinsics[1, 2], 1.0])
+            # Apply the affine transform to the center pixel
+            new_center = np.dot(M, old_center)
+
+            new_intrinsics[0, 2] = new_center[0]
+            new_intrinsics[1, 2] = new_center[1]
+
+            return {
+                "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
+                "pose": pose,
+                "betas": betas,
+                "trans": trans,
+                "cam_intrinsics": torch.from_numpy(new_intrinsics),
+                "cam_extrinsics": cam_extrinsics,
+                "landmarks_2d": torch.from_numpy(landmarks_2d_new),
+            }
+
+        except Exception as e:
+            # Fallback for corrupt files
+            print(f"Error loading {self.json_paths[idx]}: {e}")
+            return self.__getitem__((idx + 1) % len(self))
