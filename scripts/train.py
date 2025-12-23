@@ -1,17 +1,19 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
-from torch.amp import autocast, GradScaler
-from lookma.dataset import SynthBodyDataset
-from lookma.models import HMRBodyNetwork
-from lookma.losses import HMRLoss
-from lookma.geometry import rotation_6d_to_matrix
 import os
+
 import cv2
 import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from lookma.dataset import SynthBodyDataset
+from lookma.geometry import rotation_6d_to_matrix
+from lookma.losses import HMRLoss
+from lookma.models import HMRBodyNetwork
 
 # --- FINAL PRODUCTION CONFIG (RTX 5090) ---
 BATCH_SIZE = 128  # Calculated from your VRAM stress test
@@ -66,27 +68,38 @@ def save_debug_image(
     epoch,
     batch_idx,
 ):
+    """
+    Renders the mesh using the SAME logic that worked in validate_overfit.
+    """
     from lookma.visualizer import MeshRenderer
 
     with torch.no_grad():
+        # --- FIX: Slice the batch to take only the FIRST image [0:1] ---
+        p_pose_single = pred_pose[0:1]  # [1, 312]
+        p_shape_single = pred_shape[0:1]  # [1, 16]
+        p_cam_single = pred_cam[0:1]  # [1, 3]
+
         # 1. Prediction to Matrices
-        p_rotmat = rotation_6d_to_matrix(pred_pose.view(1, 52, 6))
+        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 52, 6))
+
         # 2. Kinematics
         smpl_out = smpl_model(
-            betas=pred_shape[:, :10],
+            betas=p_shape_single[:, :10],
             global_orient=p_rotmat[:, 0:1],
             body_pose=p_rotmat[:, 1:22],
             left_hand_pose=p_rotmat[:, 22:37],
             right_hand_pose=p_rotmat[:, 37:52],
             pose2rot=False,
         )
-        # 3. Rotate then Translate (Synched with validate_overfit)
+
+        # 3. Rotate then Translate
         R_ext = cam_ext[0, :3, :3]
-        verts_rotated = torch.matmul(
-            R_ext, smpl_out.vertices[0].transpose(0, 1)
-        ).transpose(0, 1)
-        verts_cam = verts_rotated + pred_cam[0]
+        verts_local = smpl_out.vertices[0]
+        verts_rotated = torch.matmul(R_ext, verts_local.transpose(0, 1)).transpose(0, 1)
+        verts_cam = verts_rotated + p_cam_single[0]
+
         # 4. Render
+        # Use first image from the image tensor [0]
         img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         renderer = MeshRenderer(width=256, height=256)
         vis_img = renderer.render_mesh(
@@ -95,6 +108,7 @@ def save_debug_image(
             smpl_model.faces,
             K=K_mat[0].cpu().numpy(),
         )
+
         os.makedirs("experiments/vis", exist_ok=True)
         cv2.imwrite(f"experiments/vis/train_e{epoch}_b{batch_idx}.jpg", vis_img)
         renderer.delete()
