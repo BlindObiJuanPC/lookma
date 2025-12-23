@@ -74,10 +74,10 @@ def save_debug_image(
     from lookma.visualizer import MeshRenderer
 
     with torch.no_grad():
-        # --- FIX: Slice the batch to take only the FIRST image [0:1] ---
-        p_pose_single = pred_pose[0:1]  # [1, 312]
-        p_shape_single = pred_shape[0:1]  # [1, 16]
-        p_cam_single = pred_cam[0:1]  # [1, 3]
+        # --- FIX: Cast to .float() to prevent Half/Float mismatch in Mixed Precision ---
+        p_pose_single = pred_pose[0:1].float()
+        p_shape_single = pred_shape[0:1].float()
+        p_cam_single = pred_cam[0:1].float()
 
         # 1. Prediction to Matrices
         p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 52, 6))
@@ -92,14 +92,13 @@ def save_debug_image(
             pose2rot=False,
         )
 
-        # 3. Rotate then Translate
-        R_ext = cam_ext[0, :3, :3]
+        # 3. Rotate then Translate (Cast cam_ext to float too)
+        R_ext = cam_ext[0, :3, :3].float()
         verts_local = smpl_out.vertices[0]
         verts_rotated = torch.matmul(R_ext, verts_local.transpose(0, 1)).transpose(0, 1)
         verts_cam = verts_rotated + p_cam_single[0]
 
         # 4. Render
-        # Use first image from the image tensor [0]
         img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         renderer = MeshRenderer(width=256, height=256)
         vis_img = renderer.render_mesh(
