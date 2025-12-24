@@ -62,48 +62,48 @@ def save_debug_image(
     pred_pose,
     pred_shape,
     pred_cam,
-    cam_ext,
+    cam_ext,  # This is the 4x4 matrix [B, 4, 4]
     K_mat,
     smpl_model,
     epoch,
     batch_idx,
 ):
-    """
-    Renders the mesh using the SAME logic that worked in validate_overfit.
-    """
     from lookma.visualizer import MeshRenderer
+    import torch
 
     with torch.no_grad():
-        # --- FIX: Cast to .float() to prevent Half/Float mismatch in Mixed Precision ---
-        p_pose_single = pred_pose[0:1].float()
-        p_shape_single = pred_shape[0:1].float()
-        p_cam_single = pred_cam[0:1].float()
+        # 1. Prepare single-sample inputs (Convert to Float32)
+        p_pose = pred_pose[0:1].float()
+        p_shape = pred_shape[0:1].float()
+        p_cam_world = pred_cam[0:1].float()  # Network predicts World Position
+        ext_mat = cam_ext[0:1].float()  # 4x4 Extrinsics
 
-        # 1. Prediction to Matrices
-        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 52, 6))
-
-        # 2. Kinematics
+        # 2. Run Kinematics
         smpl_out = smpl_model(
-            betas=p_shape_single[:, :10],
-            global_orient=p_rotmat[:, 0:1],
-            body_pose=p_rotmat[:, 1:22],
-            left_hand_pose=p_rotmat[:, 22:37],
-            right_hand_pose=p_rotmat[:, 37:52],
+            betas=p_shape[:, :10],
+            global_orient=rotation_6d_to_matrix(p_pose.view(1, 52, 6))[:, 0:1],
+            body_pose=rotation_6d_to_matrix(p_pose.view(1, 52, 6))[:, 1:22],
+            left_hand_pose=rotation_6d_to_matrix(p_pose.view(1, 52, 6))[:, 22:37],
+            right_hand_pose=rotation_6d_to_matrix(p_pose.view(1, 52, 6))[:, 37:52],
             pose2rot=False,
         )
 
-        # 3. Rotate then Translate (Cast cam_ext to float too)
-        R_ext = cam_ext[0, :3, :3].float()
-        verts_local = smpl_out.vertices[0]
-        verts_rotated = torch.matmul(R_ext, verts_local.transpose(0, 1)).transpose(0, 1)
-        verts_cam = verts_rotated + p_cam_single[0]
+        # 3. TRANSFORM TO CAMERA SPACE (Golden Logic)
+        # P_world = P_local + Pred_Translation_World
+        verts_world = smpl_out.vertices + p_cam_world.unsqueeze(1)
+
+        # P_cam = Extrinsics_4x4 * P_world_homogeneous
+        ones = torch.ones(1, verts_world.shape[1], 1, device=verts_world.device)
+        verts_homo = torch.cat([verts_world, ones], dim=-1)
+        verts_cam = torch.matmul(ext_mat, verts_homo.transpose(1, 2)).transpose(1, 2)
+        verts_cam = verts_cam[..., :3]  # Remove homogeneous coordinate
 
         # 4. Render
         img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         renderer = MeshRenderer(width=256, height=256)
         vis_img = renderer.render_mesh(
             cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR),
-            verts_cam.cpu().numpy(),
+            verts_cam[0].cpu().numpy(),
             smpl_model.faces,
             K=K_mat[0].cpu().numpy(),
         )
@@ -115,7 +115,7 @@ def save_debug_image(
 
 def train():
     print(
-        f"🚀 PRODUCTION RUN STARTING | Batch: {BATCH_SIZE} | Eff: {BATCH_SIZE * ACCUMULATION_STEPS}"
+        f"🚀 PRODUCTION RUN | Batch: {BATCH_SIZE} | Eff: {BATCH_SIZE * ACCUMULATION_STEPS}"
     )
     os.makedirs("experiments/checkpoints", exist_ok=True)
 
@@ -151,14 +151,14 @@ def train():
         total_loss = 0.0
         optimizer.zero_grad()
 
-        if epoch == 1:  # Warmup heads
+        if epoch == 1:
             for param in model.backbone.parameters():
                 param.requires_grad = False
-        if epoch == 2:  # Full train
+        if epoch == 2:
             print("🔓 Unfreezing Backbone...")
             for param in model.backbone.parameters():
                 param.requires_grad = True
-            # Re-init optimizer so it sees the new parameters
+            # Re-init optimizer to capture newly unfrozen parameters
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
             )
@@ -169,6 +169,7 @@ def train():
         progress_bar = tqdm(loader, desc=f"Epoch {epoch}")
         for batch_idx, batch in enumerate(progress_bar):
             raw_imgs = batch["image"].to(DEVICE, non_blocking=True) / 255.0
+
             if epoch >= 2:
                 raw_imgs = color_aug(raw_imgs)
                 raw_imgs = gpu_iso(raw_imgs)
@@ -177,17 +178,18 @@ def train():
             norm_imgs = TF.normalize(
                 raw_imgs, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             )
-            ext = batch["cam_extrinsics"].to(DEVICE, non_blocking=True)
+
+            # Extract 4x4 Extrinsics and World Translation
+            cam_ext = batch["cam_extrinsics"].to(DEVICE, non_blocking=True)
             gt_world_t = batch["trans"].to(DEVICE, non_blocking=True)
-            curr_batch = raw_imgs.shape[0]
-            ones = torch.ones(curr_batch, 1, 1, device=DEVICE)
-            gt_cam_t = torch.matmul(
-                ext, torch.cat([gt_world_t.unsqueeze(-1), ones], dim=1)
-            )[:, :3, 0]
+            K_mat = batch["cam_intrinsics"].to(DEVICE, non_blocking=True)
 
             with autocast("cuda"):
+                # Forward Pass
                 p_pose, p_shape, p_cam, p_ldmk = model(norm_imgs)
-                loss, comps, _ = criterion(
+
+                # Loss uses the 4x4 Extrinsics Logic
+                loss, comps, pred_joints = criterion(
                     p_pose,
                     p_shape,
                     p_cam,
@@ -195,13 +197,14 @@ def train():
                     batch["pose"].to(DEVICE),
                     batch["betas"].to(DEVICE),
                     batch["landmarks_2d"].to(DEVICE),
-                    gt_cam_t,
-                    batch["cam_intrinsics"].to(DEVICE),
-                    ext,
+                    gt_world_t,
+                    K_mat,
+                    cam_ext,
                 )
                 loss = loss / ACCUMULATION_STEPS
 
             scaler.scale(loss).backward()
+
             if (batch_idx + 1) % ACCUMULATION_STEPS == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -223,8 +226,8 @@ def train():
                     p_pose,
                     p_shape,
                     p_cam,
-                    ext,
-                    batch["cam_intrinsics"],
+                    cam_ext,
+                    K_mat,
                     viz_smpl,
                     epoch,
                     batch_idx,
