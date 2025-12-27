@@ -96,7 +96,7 @@ class HMRLoss(nn.Module):
 
         # 4. LOSSES
         loss_pose = self.l1(pred_rotmat, gt_rotmat)
-        loss_shape = self.l1(pred_shape, gt_shape)
+        loss_shape = self.l1(pred_shape, gt_shape[:, :10])
         loss_joint_t = self.l1(pred_joints_cam, gt_joints_cam)
         loss_joint_r = geodesic_loss(pred_rotmat, gt_rotmat)
         loss_trans = self.mse(pred_cam, gt_translation_cam)
