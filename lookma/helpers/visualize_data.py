@@ -595,35 +595,130 @@ def main() -> None:
 # ---------------------
 
 
-def visualize_skel(image_name: str = "img_0000020_003.jpg") -> None:
+def draw_skeleton(
+    img: np.ndarray,
+    ldmks_2d: np.ndarray,
+    connectivity: list[list[int]],
+    thickness: int = 1,
+    show_indices: bool = False,
+) -> None:
+    """Draws skeleton with limb-specific coloring.
+
+    Colors (BGR):
+    - Right Arm: Red (0, 0, 255)
+    - Right Leg: Magenta (255, 0, 255)
+    - Left Arm: Blue (255, 0, 0)
+    - Left Leg: Cyan (255, 255, 0)
+    - Others (Torso/Head): White (255, 255, 255)
+    """
+    if img.dtype != np.uint8:
+        raise ValueError("Image must be uint8")
+    if np.any(np.isnan(ldmks_2d)):
+        raise ValueError("NaNs in landmarks")
+
+    img_size = (img.shape[1], img.shape[0])
+
+    # Define limb indices
+    right_leg_indices = {2, 5, 8, 11}
+    left_leg_indices = {1, 4, 7, 10}
+    # Right arm includes shoulder, elbow, wrist, and all finger joints
+    right_arm_indices = {14, 17, 19, 21} | set(range(37, 52))
+    # Left arm includes shoulder, elbow, wrist, and all finger joints
+    left_arm_indices = {13, 16, 18, 20} | set(range(22, 37))
+
+    def get_color(idx: int) -> tuple[int, int, int]:
+        if idx in right_arm_indices:
+            return (255, 0, 0)  # Red
+        elif idx in right_leg_indices:
+            return (255, 0, 255)  # Magenta
+        elif idx in left_arm_indices:
+            return (0, 0, 255)  # Blue
+        elif idx in left_leg_indices:
+            return (0, 255, 255)  # Cyan
+        else:
+            return (255, 255, 255)  # White
+
+    ldmk_connection_pairs = ldmks_2d[np.asarray(connectivity).astype(int)].astype(int)
+
+    # Draw dark backing lines first
+    for p_0, p_1 in ldmk_connection_pairs:
+        cv2.line(img, tuple(p_0 + 1), tuple(p_1 + 1), (0, 0, 0), thickness, cv2.LINE_AA)
+
+    # Draw colored lines
+    for i, (p_0, p_1) in enumerate(ldmk_connection_pairs):
+        # Determine color based on child node (from connectivity structure)
+        # Assuming connectivity is [child, parent] or [parent, child]?
+        # LDMK_CONN['body'] = [[1, 0], [2, 0]...] -> [1,0] means 1 connects to 0. 1 is "child" (extremity side).
+        conn_pair = connectivity[i]
+        child_idx = conn_pair[0]
+
+        color = get_color(child_idx)
+        cv2.line(
+            img,
+            tuple(p_0),
+            tuple(p_1),
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    for i, ldmk in enumerate(ldmks_2d.astype(int)):
+        if np.all(ldmk > 0) and np.all(ldmk < img_size):
+            color = get_color(i)
+
+            cv2.circle(img, tuple(ldmk + 1), thickness + 1, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(
+                img,
+                tuple(ldmk),
+                thickness + 1,
+                color,
+                -1,
+                cv2.LINE_AA,
+            )
+
+            # Add indices (skip fingers 22-51)
+            if show_indices and not (22 <= i <= 51):
+                cv2.putText(
+                    img,
+                    str(i),
+                    (ldmk[0] + 5, ldmk[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (255, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+
+def visualize_skel(image: str = "img_0000020_003.jpg", indices: bool = False) -> None:
     dir = Path("./data/synth_body")
 
     # Load image.
-    img_file = dir / image_name
+    img_file = dir / image
     image_rgb = cv2.cvtColor(cv2.imread(str(img_file)), cv2.COLOR_BGR2RGB)
 
     # Load metadata.
-    meta_file = dir / image_name.replace("img_", "metadata_").replace(".jpg", ".json")
+    meta_file = dir / image.replace("img_", "metadata_").replace(".jpg", ".json")
     with open(meta_file, "r") as f:
         metadata = json.load(f)
 
     # Visualize landmarks.
     ldmks_2d = np.asarray(metadata["landmarks"]["2D"])
     ldmk_vis = image_rgb.copy()
-    draw_landmarks_annotated(ldmk_vis, ldmks_2d, LDMK_CONN["body"])
+    draw_skeleton(ldmk_vis, ldmks_2d, LDMK_CONN["body"], show_indices=indices)
     cv2.imshow("Landmarks", cv2.cvtColor(ldmk_vis, cv2.COLOR_RGB2BGR))
     cv2.waitKey(0)
 
 
-def visualize_mesh(image_name: str = "img_0000020_003.jpg") -> None:
+def visualize_mesh(image: str = "img_0000020_003.jpg") -> None:
     dir = Path("./data/synth_body")
 
     # Load image.
-    img_file = dir / image_name
+    img_file = dir / image
     image_rgb = cv2.cvtColor(cv2.imread(str(img_file)), cv2.COLOR_BGR2RGB)
 
     # Load metadata.
-    meta_file = dir / image_name.replace("img_", "metadata_").replace(".jpg", ".json")
+    meta_file = dir / image.replace("img_", "metadata_").replace(".jpg", ".json")
     with open(meta_file, "r") as f:
         metadata = json.load(f)
 
