@@ -117,3 +117,34 @@ def perspective_projection(
     points_2d = xy / z
 
     return points_2d
+
+
+def batch_get_global_rotation(
+    local_rotmats: torch.Tensor, parents: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute global rotation matrices from local rotation matrices using the kinematic tree.
+
+    Args:
+        local_rotmats: [Batch, N_Joints, 3, 3]
+        parents: [N_Joints] (Kinematic tree indices)
+
+    Returns:
+        global_rotmats: [Batch, N_Joints, 3, 3]
+    """
+    batch_size, n_joints, _, _ = local_rotmats.shape
+    global_rotmats = [None] * n_joints
+
+    # Iterate through joints (SMPL parents are sorted, so we can iterate in order)
+    for i in range(n_joints):
+        parent_idx = parents[i]
+        if parent_idx < 0:
+            # Root joint
+            global_rotmats[i] = local_rotmats[:, i]
+        else:
+            # Child joint: R_global = R_parent_global @ R_local
+            global_rotmats[i] = torch.matmul(
+                global_rotmats[parent_idx], local_rotmats[:, i]
+            )
+
+    return torch.stack(global_rotmats, dim=1)

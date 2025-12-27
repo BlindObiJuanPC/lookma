@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from lookma.helpers.geometry import (
+    batch_get_global_rotation,
     batch_rodrigues,
     perspective_projection,
     rotation_6d_to_matrix,
@@ -33,7 +34,6 @@ class HMRLoss(nn.Module):
         self.w_shape = 1.0
         self.w_joint_t = 5.0
         self.w_joint_r = 1.0
-        self.w_trans = 5.0
 
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss()
@@ -55,16 +55,22 @@ class HMRLoss(nn.Module):
         device = pred_pose_6d.device
 
         # 1. PREPARE PARAMETERS
-        pred_rotmat = rotation_6d_to_matrix(pred_pose_6d.view(batch_size, 52, 6))
+        # Converting 21 body joints to Rotation Matrices
+        pred_body_rotmat = rotation_6d_to_matrix(pred_pose_6d.view(batch_size, 21, 6))
         gt_rotmat = batch_rodrigues(gt_pose_aa.view(batch_size, 52, 3))
+
+        # Reconstruct Full Pose: GT Root (0) + Pred Body (1-21) + GT Hands (22-51)
+        # We clone GT first to fill in 0 and 22-51 automatically
+        full_pred_rotmat = gt_rotmat.clone()
+        full_pred_rotmat[:, 1:22] = pred_body_rotmat
 
         # 2. RUN KINEMATICS (Local Space)
         pred_output = self.smpl(
             betas=pred_shape[:, :10],
-            global_orient=pred_rotmat[:, 0:1],
-            body_pose=pred_rotmat[:, 1:22],
-            left_hand_pose=pred_rotmat[:, 22:37],
-            right_hand_pose=pred_rotmat[:, 37:52],
+            global_orient=full_pred_rotmat[:, 0:1],
+            body_pose=full_pred_rotmat[:, 1:22],
+            left_hand_pose=full_pred_rotmat[:, 22:37],
+            right_hand_pose=full_pred_rotmat[:, 37:52],
             pose2rot=False,
         )
 
@@ -78,7 +84,7 @@ class HMRLoss(nn.Module):
                 pose2rot=False,
             )
 
-        # 3. TRANSFORM TO CAMERA SPACE (Rotate then Translate)
+        # TRANSFORM TO CAMERA SPACE (Rotate then Translate)
         R_ext = cam_extrinsics[:, :3, :3]
 
         # Predicted joints in Camera Space
@@ -95,13 +101,27 @@ class HMRLoss(nn.Module):
         gt_joints_cam = gt_joints_rotated + gt_translation_cam.unsqueeze(1)
 
         # 4. LOSSES
-        loss_pose = self.l1(pred_rotmat, gt_rotmat)
-        loss_shape = self.l1(pred_shape, gt_shape[:, :10])
-        loss_joint_t = self.l1(pred_joints_cam, gt_joints_cam)
-        loss_joint_r = geodesic_loss(pred_rotmat, gt_rotmat)
-        loss_trans = self.mse(pred_cam, gt_translation_cam)
+        # Pose/Rot (Local): Indices 1-21 (Body)
+        loss_pose = self.l1(pred_body_rotmat, gt_rotmat[:, 1:22])
 
-        # 5. DENSE LANDMARKS
+        # Pose/Rot (Global/World): Indices 1-21 (Body)
+        # 1. Compute Global Rotations via FK
+        pred_global_rotmat = batch_get_global_rotation(
+            full_pred_rotmat, self.smpl.parents
+        )
+        gt_global_rotmat = batch_get_global_rotation(gt_rotmat, self.smpl.parents)
+        # 2. Compare Global Rotations (Geodesic)
+        loss_joint_r = geodesic_loss(
+            pred_global_rotmat[:, 1:22], gt_global_rotmat[:, 1:22]
+        )
+
+        loss_shape = self.l1(pred_shape, gt_shape[:, :10])
+
+        # Joint Position (World): Indices 0-21 (Body + Pelvis)
+        # Comparing SMPL output joints directly (conceptually + T_gt on both sides)
+        loss_joint_t = self.l1(pred_output.joints[:, :22], gt_output.joints[:, :22])
+
+        # DENSE LANDMARKS
         with torch.no_grad():
             gt_verts_rotated = torch.matmul(
                 R_ext, gt_output.vertices[:, ::5].transpose(1, 2)
@@ -126,7 +146,6 @@ class HMRLoss(nn.Module):
             + (self.w_joint_t * loss_joint_t)
             + (self.w_joint_r * loss_joint_r)
             + (self.w_dense * loss_dense)
-            + (self.w_trans * loss_trans)
         )
 
         # Re-Project for debug visualization
@@ -141,7 +160,6 @@ class HMRLoss(nn.Module):
                 "loss_pose": loss_pose.item(),
                 "loss_joint_t": loss_joint_t.item(),
                 "loss_dense": loss_dense.item(),
-                "loss_trans": loss_trans.item(),
             },
             pred_joints_2d,
         )
