@@ -42,11 +42,9 @@ class HMRLoss(nn.Module):
         self,
         pred_pose_6d,
         pred_shape,
-        pred_cam,
         pred_ldmk,
         gt_pose_aa,
         gt_shape,
-        gt_ldmks_2d,
         gt_translation_cam,
         cam_intrinsics,
         cam_extrinsics,
@@ -84,22 +82,6 @@ class HMRLoss(nn.Module):
                 pose2rot=False,
             )
 
-        # TRANSFORM TO CAMERA SPACE (Rotate then Translate)
-        R_ext = cam_extrinsics[:, :3, :3]
-
-        # Predicted joints in Camera Space
-        # Order: R_cam * Joints_Local + T_cam
-        pred_joints_rotated = torch.matmul(
-            R_ext, pred_output.joints.transpose(1, 2)
-        ).transpose(1, 2)
-        pred_joints_cam = pred_joints_rotated + pred_cam.unsqueeze(1)
-
-        # Ground Truth joints in Camera Space
-        gt_joints_rotated = torch.matmul(
-            R_ext, gt_output.joints.transpose(1, 2)
-        ).transpose(1, 2)
-        gt_joints_cam = gt_joints_rotated + gt_translation_cam.unsqueeze(1)
-
         # 4. LOSSES
         # Pose/Rot (Local): Indices 1-21 (Body)
         loss_pose = self.l1(pred_body_rotmat, gt_rotmat[:, 1:22])
@@ -123,6 +105,7 @@ class HMRLoss(nn.Module):
 
         # DENSE LANDMARKS
         with torch.no_grad():
+            R_ext = cam_extrinsics[:, :3, :3]
             gt_verts_rotated = torch.matmul(
                 R_ext, gt_output.vertices[:, ::5].transpose(1, 2)
             ).transpose(1, 2)
@@ -149,7 +132,14 @@ class HMRLoss(nn.Module):
         )
 
         # Re-Project for debug visualization
-        # We pass zero translation to perspective_projection because pred_joints_cam already includes it
+        # Use GT Camera parameters since we don't predict them anymore
+        # 1. Rotate to Cam Frame
+        pred_joints_rotated = torch.matmul(
+            R_ext, pred_output.joints.transpose(1, 2)
+        ).transpose(1, 2)
+        # 2. Add GT Translation
+        pred_joints_cam = pred_joints_rotated + gt_translation_cam.unsqueeze(1)
+        # 3. Project
         pred_joints_2d = perspective_projection(
             pred_joints_cam, torch.zeros(batch_size, 3, device=device), cam_intrinsics
         )
