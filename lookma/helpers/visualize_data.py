@@ -255,6 +255,75 @@ def draw_landmarks(
             )
 
 
+def draw_landmarks_annotated(
+    img: np.ndarray,
+    ldmks_2d: np.ndarray,
+    connectivity: list[list[int]],
+    thickness: int = 1,
+    color: tuple[int, int, int] = (255, 255, 255),
+) -> None:
+    """Drawing dots on an image with specific annotations."""
+    if img.dtype != np.uint8:
+        raise ValueError("Image must be uint8")
+    if np.any(np.isnan(ldmks_2d)):
+        raise ValueError("NaNs in landmarks")
+
+    img_size = (img.shape[1], img.shape[0])
+
+    ldmk_connection_pairs = ldmks_2d[np.asarray(connectivity).astype(int)].astype(int)
+    for p_0, p_1 in ldmk_connection_pairs:
+        cv2.line(img, tuple(p_0 + 1), tuple(p_1 + 1), (0, 0, 0), thickness, cv2.LINE_AA)
+    for i, (p_0, p_1) in enumerate(ldmk_connection_pairs):
+        cv2.line(
+            img,
+            tuple(p_0),
+            tuple(p_1),
+            (int(color[0]), int(color[1]), int(color[2])),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    for i, ldmk in enumerate(ldmks_2d.astype(int)):
+        if np.all(ldmk > 0) and np.all(ldmk < img_size):
+            # 0 is pelvis, 22-51 are fingers
+            is_highlight = (i == 0) or (22 <= i <= 51)
+            # Red in BGR is (0, 0, 255) but code uses RGB passed as color then casts.
+            # However, cv2.circle uses BGR. draw_landmarks passed (255, 255, 255).
+            # If we want RED in the output image (which is RGB when passed to functions but cv2 functions usually assume BGR unless we are careful).
+            # visualize_skel passes an RGB image copy (ldmk_vis).
+            # cv2.circle on RGB image: Red is (255, 0, 0).
+            # Normal color is white (255, 255, 255).
+
+            circle_color = (
+                (255, 0, 0)
+                if is_highlight
+                else (int(color[0]), int(color[1]), int(color[2]))
+            )
+
+            cv2.circle(img, tuple(ldmk + 1), thickness + 1, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(
+                img,
+                tuple(ldmk),
+                thickness + 1,
+                circle_color,
+                -1,
+                cv2.LINE_AA,
+            )
+
+            # Avoid indices on fingers (22-51)
+            if not (22 <= i <= 51):
+                cv2.putText(
+                    img,
+                    str(i),
+                    (ldmk[0] + 5, ldmk[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (255, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+
 def _download_smplh() -> None:
     return None  # Disable download as I've downloaded it elsewhere.
     print("Downloading SMPL-H...")
@@ -541,7 +610,7 @@ def visualize_skel(image_name: str = "img_0000020_003.jpg") -> None:
     # Visualize landmarks.
     ldmks_2d = np.asarray(metadata["landmarks"]["2D"])
     ldmk_vis = image_rgb.copy()
-    draw_landmarks(ldmk_vis, ldmks_2d, LDMK_CONN["body"])
+    draw_landmarks_annotated(ldmk_vis, ldmks_2d, LDMK_CONN["body"])
     cv2.imshow("Landmarks", cv2.cvtColor(ldmk_vis, cv2.COLOR_RGB2BGR))
     cv2.waitKey(0)
 
@@ -573,4 +642,4 @@ def visualize_mesh(image_name: str = "img_0000020_003.jpg") -> None:
 
 if __name__ == "__main__":
     image = "img_0000020_003.jpg"
-    visualize_mesh(image)
+    visualize_skel(image)
