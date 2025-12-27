@@ -35,6 +35,7 @@ import smplx
 import torch
 import trimesh
 from transformations import rotation_matrix
+from lookma.helpers.geometry import perspective_projection
 
 MODEL_PATH = "data/smplx"
 SEMSEG_LUT = (plt.get_cmap("tab20")(np.arange(255 + 1)) * 255).astype(np.uint8)[
@@ -735,6 +736,137 @@ def visualize_mesh(image: str = "img_0000020_003.jpg") -> None:
     cv2.waitKey(0)
 
 
+def visualize_landmarks(image: str = "img_0000020_003.jpg") -> None:
+    """
+    Visualizes Ground Truth dense landmarks using the EXACT projection logic
+    from lookma/losses.py to verify correctness.
+    """
+    dir = Path("./data/synth_body")
+
+    # Load image.
+    img_file = dir / image
+    image_bgr = cv2.imread(str(img_file))
+
+    # Load metadata.
+    meta_file = dir / image.replace("img_", "metadata_").replace(".jpg", ".json")
+    with open(meta_file, "r") as f:
+        metadata = json.load(f)
+
+    # 1. SETUP SMPL & PARAMETERS
+    smplh = _get_smplh()
+
+    # Pose (flattened)
+    pose = np.asarray(metadata["pose"]).flatten()
+    betas = (
+        torch.from_numpy(np.asarray(metadata["body_identity"])[:10])
+        .float()
+        .unsqueeze(0)
+    )
+    global_orient = torch.from_numpy(pose[:3]).float().unsqueeze(0)
+    body_pose = torch.from_numpy(pose[3:66]).float().unsqueeze(0)
+
+    # Handle hands if present (metadata pose length > 66)
+    left_hand_pose = (
+        torch.from_numpy(pose[66:114]).float().unsqueeze(0)
+        if len(pose) > 66
+        else torch.zeros(1, 45, dtype=torch.float32)
+    )
+    right_hand_pose = (
+        torch.from_numpy(pose[114:162]).float().unsqueeze(0)
+        if len(pose) > 114
+        else torch.zeros(1, 45, dtype=torch.float32)
+    )
+
+    # Note: metadata["translation"] is the Global Translation T.
+    # In losses.py, we usually assume the SMPL output is at (0,0,0) and we add T later
+    # OR we pass T to SMPL.
+    # The 'losses.py' logic for DENSE LANDMARKS was:
+    #   gt_verts_rotated = R_ext @ (verts_local).T
+    #   gt_verts_cam = gt_verts_rotated + gt_translation_cam
+    #
+    # Wait, 'gt_translation_cam' in losses.py is usually T_cam.
+    # But here metadata has "translation" (World) and "world_to_camera" (R, T).
+    #
+    # Let's verify what losses.py uses.
+    # losses.py uses: 'gt_translation_cam' which comes from the batch['trans'] usually converted to cam space?
+    # Actually, in train.py: gt_cam_t = (ext @ (trans, 1)) ...
+    # So 'gt_translation_cam' is indeed T_world transformed to Camera Space.
+
+    # Let's replicate that exact chain.
+
+    # A. Get Local Vertices (at origin)
+    smpl_out = smplh(
+        betas=betas,
+        global_orient=global_orient,
+        body_pose=body_pose,
+        left_hand_pose=left_hand_pose,
+        right_hand_pose=right_hand_pose,
+        transl=torch.zeros(1, 3),  # Local space
+    )
+    # Downsample 5 (as per losses.py)
+    verts_local = smpl_out.vertices[:, ::5]  # [1, N, 3]
+
+    # B. Camera Parameters
+    # Metadata has 'world_to_camera' 4x4.
+    w2c = np.asarray(metadata["camera"]["world_to_camera"])
+    R_ext = torch.from_numpy(w2c[:3, :3]).float().unsqueeze(0)  # [1, 3, 3]
+
+    # T_world from metadata
+    T_world = torch.from_numpy(np.asarray(metadata["translation"])).float()  # [3]
+
+    # Calculate T_cam = R_ext @ T_world + T_ext_offset?
+    # Usually W2C matrix contains the rotation AND the translation of the camera relative to world
+    # OR it handles the transforms.
+    # W2C * P_world = P_cam.
+    # P_world = P_local + T_world.
+    # P_cam = W2C * (P_local + T_world)
+    #       = R * (P_local + T_) + t_w2c
+    #       = R*P_local + (R*T_world + t_w2c)
+    #
+    # In train.py: calculate gt_cam_t = R * T_world (assuming camera is at 0,0,0 ?? No wait).
+    # train.py line 184: gt_cam_t = torch.matmul(ext, torch.cat([gt_world_t, 1]))
+    # This implies 'ext' is the full 4x4 World-to-Camera matrix.
+
+    # So effectively: T_cam_total = Matmul(ext, (T_world, 1))
+
+    T_world_homo = torch.cat([T_world, torch.ones(1)]).unsqueeze(1)  # [4, 1]
+    w2c_torch = torch.from_numpy(w2c).float()  # [4, 4]
+
+    T_cam_homo = torch.matmul(w2c_torch, T_world_homo)  # [4, 1]
+    T_cam_total = T_cam_homo[:3, 0].unsqueeze(
+        0
+    )  # [1, 3] -- This is 'gt_translation_cam'
+
+    # C. Apply Transforms (Logic from losses.py)
+    # gt_verts_rotated = torch.matmul(R_ext, gt_output.vertices[:, ::5].transpose(1, 2)).transpose(1, 2)
+    gt_verts_rotated = torch.matmul(R_ext, verts_local.transpose(1, 2)).transpose(1, 2)
+
+    # gt_verts_cam = gt_verts_rotated + gt_translation_cam.unsqueeze(1)
+    gt_verts_cam = gt_verts_rotated + T_cam_total.unsqueeze(1)
+
+    # D. Project
+    K = (
+        torch.from_numpy(np.asarray(metadata["camera"]["camera_to_image"]))
+        .float()
+        .unsqueeze(0)
+    )
+
+    # gt_dense_2d = perspective_projection(gt_verts_cam, zeros, K)
+    gt_dense_2d = perspective_projection(
+        gt_verts_cam, torch.zeros(1, 3), K
+    )  # [1, N, 2]
+
+    # DRAW
+    points = gt_dense_2d[0].cpu().numpy()
+
+    # Draw Green dots for dense landmarks
+    for pt in points:
+        cv2.circle(image_bgr, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+
+    cv2.imshow("Dense Landmarks Verification", image_bgr)
+    cv2.waitKey(0)
+
+
 if __name__ == "__main__":
     image = "img_0000020_003.jpg"
-    visualize_skel(image)
+    visualize_landmarks(image)
