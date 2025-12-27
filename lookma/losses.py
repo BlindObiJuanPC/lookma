@@ -1,7 +1,12 @@
+import smplx
 import torch
 import torch.nn as nn
-import smplx
-from .geometry import batch_rodrigues, rotation_6d_to_matrix, perspective_projection
+
+from lookma.helpers.geometry import (
+    batch_rodrigues,
+    perspective_projection,
+    rotation_6d_to_matrix,
+)
 
 
 def geodesic_loss(R1, R2):
