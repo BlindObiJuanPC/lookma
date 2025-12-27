@@ -14,6 +14,7 @@ from lookma.dataset import SynthBodyDataset
 from lookma.geometry import rotation_6d_to_matrix
 from lookma.losses import HMRLoss
 from lookma.models import HMRBodyNetwork
+from lookma.helpers.visualize_data import draw_mesh
 
 # --- FINAL PRODUCTION CONFIG (RTX 5090) ---
 BATCH_SIZE = 128  # Calculated from your VRAM stress test
@@ -61,7 +62,8 @@ def save_debug_image(
     image_tensor,
     pred_pose,
     pred_shape,
-    pred_cam,
+    gt_pose,
+    gt_world_t,
     cam_ext,
     K_mat,
     smpl_model,
@@ -71,46 +73,50 @@ def save_debug_image(
     """
     Renders the mesh using the SAME logic that worked in validate_overfit.
     """
-    from lookma.visualizer import MeshRenderer
-
     with torch.no_grad():
         # --- FIX: Cast to .float() to prevent Half/Float mismatch in Mixed Precision ---
         p_pose_single = pred_pose[0:1].float()
         p_shape_single = pred_shape[0:1].float()
-        p_cam_single = pred_cam[0:1].float()
+        p_trans_single = gt_world_t[0:1].float()
 
-        # 1. Prediction to Matrices
-        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 52, 6))
+        # 1. Prediction to Matrices [1, 21, 3, 3] (Body Only)
+        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))
 
-        # 2. Kinematics
-        smpl_out = smpl_model(
-            betas=p_shape_single[:, :10],
-            global_orient=p_rotmat[:, 0:1],
-            body_pose=p_rotmat[:, 1:22],
-            left_hand_pose=p_rotmat[:, 22:37],
-            right_hand_pose=p_rotmat[:, 37:52],
-            pose2rot=False,
-        )
+        # 2. Hybrid Pose Construction (Match Loss Logic)
+        # GT Pose is [B, 52, 3] (Axis Angle) -> [B, 52, 3, 3] (RotMat) for easy blending
+        from lookma.helpers.geometry import batch_rodrigues
 
-        # 3. Rotate then Translate (Cast cam_ext to float too)
-        R_ext = cam_ext[0, :3, :3].float()
-        verts_local = smpl_out.vertices[0]
-        verts_rotated = torch.matmul(R_ext, verts_local.transpose(0, 1)).transpose(0, 1)
-        verts_cam = verts_rotated + p_cam_single[0]
+        gt_rotmat = batch_rodrigues(gt_pose[0:1].view(1, 52, 3))
 
-        # 4. Render
+        # Clone GT and overwrite Body joints (1-21) with Prediction
+        full_rotmat = gt_rotmat.clone()
+        full_rotmat[0, 1:22] = p_rotmat[0]
+
+        # 3. Convert Hybrid Matrices to Axis-Angle for draw_mesh
+        rots_np = full_rotmat[0].cpu().numpy()  # [52, 3, 3]
+        pose_aa_flat = []
+        for i in range(52):
+            aa, _ = cv2.Rodrigues(rots_np[i])
+            pose_aa_flat.append(aa.squeeze())
+        pose_aa_flat = np.concatenate(pose_aa_flat)  # [156]
+
         img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        renderer = MeshRenderer(width=256, height=256)
-        vis_img = renderer.render_mesh(
-            cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR),
-            verts_cam.cpu().numpy(),
-            smpl_model.faces,
-            K=K_mat[0].cpu().numpy(),
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 3. Call Visualizer
+        # We pass GT World Translation + Camera Extrinsics
+        # draw_mesh will run: Verts = SMPL(Pose, Trans); Render(Verts, Ext)
+        vis_img = draw_mesh(
+            img_bgr,
+            p_shape_single[0].cpu().numpy(),
+            pose_aa_flat,
+            p_trans_single[0].cpu().numpy(),
+            cam_ext[0].cpu().numpy(),
+            K_mat[0].cpu().numpy(),
         )
 
         os.makedirs("experiments/vis", exist_ok=True)
         cv2.imwrite(f"experiments/vis/train_e{epoch}_b{batch_idx}.jpg", vis_img)
-        renderer.delete()
 
 
 def train():
@@ -186,15 +192,13 @@ def train():
             )[:, :3, 0]
 
             with autocast("cuda"):
-                p_pose, p_shape, p_cam, p_ldmk = model(norm_imgs)
+                p_pose, p_shape, p_ldmk = model(norm_imgs)
                 loss, comps, _ = criterion(
                     p_pose,
                     p_shape,
-                    p_cam,
                     p_ldmk,
                     batch["pose"].to(DEVICE),
                     batch["betas"].to(DEVICE),
-                    batch["landmarks_2d"].to(DEVICE),
                     gt_cam_t,
                     batch["cam_intrinsics"].to(DEVICE),
                     ext,
@@ -222,7 +226,8 @@ def train():
                     raw_imgs,
                     p_pose,
                     p_shape,
-                    p_cam,
+                    batch["pose"].to(DEVICE),
+                    gt_world_t,
                     ext,
                     batch["cam_intrinsics"],
                     viz_smpl,
