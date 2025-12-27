@@ -24,9 +24,14 @@ class HMRBodyNetwork(nn.Module):
                 nn.Linear(512, output_dim),
             )
 
-        self.pose_head = make_head(52 * 6)  # 312
-        self.shape_head = make_head(16)  # 16
-        self.ldmk_head = make_head(self.n_dense * 3)  # 1378 * 3
+        # Predict 6D rotations for 21 main body joints (no pelvis/hands).
+        self.pose_head = make_head(21 * 6)
+
+        # Predict the first 10 body-shape parameters.
+        self.shape_head = make_head(10)
+
+        # Predict the location of every 5th vertex in 2D.
+        self.ldmk_head = make_head(self.n_dense * 3)
 
         # Initialize Weights
 
@@ -41,8 +46,8 @@ class HMRBodyNetwork(nn.Module):
     def forward(self, x):
         """
         Returns:
-            pred_pose: [B, 312]
-            pred_shape: [B, 16]
+            pred_pose: [B, 126] (21 joints * 6D)
+            pred_shape: [B, 10]
             pred_ldmk: [B, 1378, 3] (x, y, log_var)
         """
         features = self.backbone(x)
