@@ -11,13 +11,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lookma.dataset import SynthBodyDataset
-from lookma.geometry import rotation_6d_to_matrix
+from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
+from lookma.helpers.visualize_data import draw_mesh
 from lookma.losses import HMRLoss
 from lookma.models import HMRBodyNetwork
-from lookma.helpers.visualize_data import draw_mesh
 
 # --- FINAL PRODUCTION CONFIG (RTX 5090) ---
-BATCH_SIZE = 128  # Calculated from your VRAM stress test
+BATCH_SIZE = 128  # Calculated from a VRAM stress test
 ACCUMULATION_STEPS = 2  # 128 * 2 = 256 Effective Batch (Official Paper Spec)
 LEARNING_RATE = 1e-4  # Official Paper Spec
 NUM_EPOCHS = 60  # Long-form convergence
@@ -66,33 +66,27 @@ def save_debug_image(
     gt_world_t,
     cam_ext,
     K_mat,
-    smpl_model,
     epoch,
     batch_idx,
 ):
-    """
-    Renders the mesh using the SAME logic that worked in validate_overfit.
-    """
     with torch.no_grad():
         # --- FIX: Cast to .float() to prevent Half/Float mismatch in Mixed Precision ---
         p_pose_single = pred_pose[0:1].float()
         p_shape_single = pred_shape[0:1].float()
         p_trans_single = gt_world_t[0:1].float()
 
-        # 1. Prediction to Matrices [1, 21, 3, 3] (Body Only)
+        # Prediction to Matrices [1, 21, 3, 3] (Body Only)
         p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))
 
-        # 2. Hybrid Pose Construction (Match Loss Logic)
+        # Hybrid Pose Construction (Match Loss Logic)
         # GT Pose is [B, 52, 3] (Axis Angle) -> [B, 52, 3, 3] (RotMat) for easy blending
-        from lookma.helpers.geometry import batch_rodrigues
-
         gt_rotmat = batch_rodrigues(gt_pose[0:1].view(1, 52, 3))
 
         # Clone GT and overwrite Body joints (1-21) with Prediction
         full_rotmat = gt_rotmat.clone()
         full_rotmat[0, 1:22] = p_rotmat[0]
 
-        # 3. Convert Hybrid Matrices to Axis-Angle for draw_mesh
+        # Convert Hybrid Matrices to Axis-Angle for draw_mesh
         rots_np = full_rotmat[0].cpu().numpy()  # [52, 3, 3]
         pose_aa_flat = []
         for i in range(52):
@@ -103,7 +97,7 @@ def save_debug_image(
         img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        # 3. Call Visualizer
+        # Call Visualizer
         # We pass GT World Translation + Camera Extrinsics
         # draw_mesh will run: Verts = SMPL(Pose, Trans); Render(Verts, Ext)
         vis_img = draw_mesh(
@@ -121,7 +115,7 @@ def save_debug_image(
 
 def train():
     print(
-        f"🚀 PRODUCTION RUN STARTING | Batch: {BATCH_SIZE} | Eff: {BATCH_SIZE * ACCUMULATION_STEPS}"
+        f"PRODUCTION RUN STARTING | Batch: {BATCH_SIZE} | Eff: {BATCH_SIZE * ACCUMULATION_STEPS}"
     )
     os.makedirs("experiments/checkpoints", exist_ok=True)
 
@@ -143,12 +137,6 @@ def train():
     criterion = HMRLoss("data/smplx", device=DEVICE)
     scaler = GradScaler("cuda")
 
-    import smplx
-
-    viz_smpl = smplx.create(
-        "data/smplx", model_type="smplh", gender="neutral", use_pca=False, num_betas=10
-    ).to(DEVICE)
-    viz_smpl.pose_mean = torch.tensor([0.0], device=DEVICE)
     gpu_iso = AddISONoise().to(DEVICE)
     gpu_pixel = Pixelate().to(DEVICE)
 
@@ -161,7 +149,7 @@ def train():
             for param in model.backbone.parameters():
                 param.requires_grad = False
         if epoch == 2:  # Full train
-            print("🔓 Unfreezing Backbone...")
+            print("Unfreezing Backbone...")
             for param in model.backbone.parameters():
                 param.requires_grad = True
             # Re-init optimizer so it sees the new parameters
@@ -230,13 +218,14 @@ def train():
                     gt_world_t,
                     ext,
                     batch["cam_intrinsics"],
-                    viz_smpl,
                     epoch,
                     batch_idx,
                 )
 
         scheduler.step()
-        print(f"Epoch {epoch} Avg Loss: {total_loss / len(loader):.4f}")
+        learning_rate = scheduler.get_last_lr()[0]
+        average_loss = total_loss / len(loader)
+        print(f"Epoch {epoch} Avg Loss: {average_loss:.4f} | LR: {learning_rate:.6f}")
         torch.save(
             model.state_dict(), f"experiments/checkpoints/model_epoch_{epoch}.pth"
         )
