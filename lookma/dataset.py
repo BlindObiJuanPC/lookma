@@ -88,7 +88,7 @@ class SynthBodyDataset(Dataset):
             trans = torch.tensor(meta["translation"], dtype=torch.float32)
             landmarks_2d = np.array(meta["landmarks"]["2D"], dtype=np.float32)
 
-            # --- 1. CALCULATE CROP BOX ---
+            # --- CALCULATE CROP BOX ---
             min_x, max_x = np.min(landmarks_2d[:, 0]), np.max(landmarks_2d[:, 0])
             min_y, max_y = np.min(landmarks_2d[:, 1]), np.max(landmarks_2d[:, 1])
             center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
@@ -97,7 +97,7 @@ class SynthBodyDataset(Dataset):
             height = max_y - min_y
             base_size = max(width, height) * 1.2  # 1.2x padding standard
 
-            # --- 2. AUGMENTATION CALCS ---
+            # --- AUGMENTATION CALCS ---
             rot, scale_aug, shift_x, shift_y = self.get_aug_params(base_size)
 
             # Apply shifts to center
@@ -111,7 +111,7 @@ class SynthBodyDataset(Dataset):
             # If scale_aug = 0.8 (Zoom In), the crop box must get SMALLER.
             proc_size = base_size / scale_aug
 
-            # --- 3. AFFINE TRANSFORM ---
+            # --- AFFINE TRANSFORM ---
             # Define destination dimensions
             dst_size = self.target_size
             dst_center = dst_size / 2.0
@@ -120,11 +120,11 @@ class SynthBodyDataset(Dataset):
             # This variable is needed for both Matrix M and updating Intrinsics later
             scale_ratio = dst_size / proc_size
 
-            # 1. Create Rotation/Scale matrix centered on the PERSON
+            # Create Rotation/Scale matrix centered on the PERSON
             # getRotationMatrix2D handles rotation around a point AND scaling
             M = cv2.getRotationMatrix2D((center_x, center_y), rot, scale_ratio)
 
-            # 2. Adjust Translation to center the result in the OUTPUT image
+            # Adjust Translation to center the result in the OUTPUT image
             # We shift the matrix so the person moves from 'center_x' to 'dst_center'
             M[0, 2] += dst_center - center_x
             M[1, 2] += dst_center - center_y
@@ -143,7 +143,7 @@ class SynthBodyDataset(Dataset):
             landmarks_homo = np.hstack([landmarks_2d, ones])
             landmarks_2d_new = np.dot(M, landmarks_homo.T).T
 
-            # --- 4. UPDATE INTRINSICS (K) ---
+            # --- UPDATE INTRINSICS (K) ---
             # scale_ratio is now correctly defined above
             new_intrinsics = cam_intrinsics.copy()
             new_intrinsics[0, 0] *= scale_ratio  # fx
