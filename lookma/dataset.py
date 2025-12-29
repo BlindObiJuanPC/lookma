@@ -8,10 +8,11 @@ import glob
 
 
 class SynthBodyDataset(Dataset):
-    def __init__(self, root_dir, specific_image=None, target_size=256, is_train=True):
+    def __init__(self, root_dir, specific_image=None, target_size=256, is_train=True, return_debug_info=False):
         self.root_dir = root_dir
         self.target_size = target_size
         self.is_train = is_train  # Turns augmentation on/off
+        self.return_debug_info = return_debug_info
 
         print(f"Scanning {root_dir} for metadata files...")
         if specific_image:
@@ -158,6 +159,25 @@ class SynthBodyDataset(Dataset):
             new_intrinsics[0, 2] = new_center[0]
             new_intrinsics[1, 2] = new_center[1]
 
+            if self.return_debug_info:
+                return {
+                    "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
+                    "pose": pose,
+                    "betas": betas,
+                    "trans": trans,
+                    "cam_intrinsics": torch.from_numpy(new_intrinsics),
+                    "cam_extrinsics": cam_extrinsics,
+                    "landmarks_2d": torch.from_numpy(landmarks_2d_new),
+                    # Debug info
+                    "original_image": image,  # The raw loaded image (no crop, no resize)
+                    "aug_params": {
+                        "rot": rot,
+                        "scale": scale_aug,  # Use the selected scale factor
+                        "shift_x": shift_x,
+                        "shift_y": shift_y,
+                    },
+                }
+
             return {
                 "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
                 "pose": pose,
@@ -172,3 +192,8 @@ class SynthBodyDataset(Dataset):
             # Fallback for corrupt files
             print(f"Error loading {self.json_paths[idx]}: {e}")
             return self.__getitem__((idx + 1) % len(self))
+
+
+class SynthHandDataset(SynthBodyDataset):
+    def __init__(self, root_dir, specific_image=None, target_size=128, is_train=True, return_debug_info=False):
+        super().__init__(root_dir, specific_image, target_size, is_train, return_debug_info)
