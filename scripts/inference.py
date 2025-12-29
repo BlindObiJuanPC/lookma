@@ -1,7 +1,7 @@
-from PIL.ImagePalette import random
 import glob
 import json
 import os
+import random
 
 import cv2
 import numpy as np
@@ -14,6 +14,42 @@ from lookma.helpers.visualize_data import draw_mesh
 from lookma.models import HMRBodyNetwork
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def get_affine_transform(meta, target_size=256):
+    # Replicate logic from SynthBodyDataset.__getitem__
+    # to get the affine transform matrix M
+    landmarks_2d = np.array(meta["landmarks"]["2D"], dtype=np.float32)
+
+    min_x, max_x = np.min(landmarks_2d[:, 0]), np.max(landmarks_2d[:, 0])
+    min_y, max_y = np.min(landmarks_2d[:, 1]), np.max(landmarks_2d[:, 1])
+    center_x, center_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+
+    width = max_x - min_x
+    height = max_y - min_y
+    base_size = max(width, height) * 1.2
+
+    # is_train=False logic (no random augs)
+    rot = 0
+    scale_aug = 1.0  # Default scale logic for eval
+    shift_x = 0.0
+    shift_y = 0.0
+
+    # Apply shifts (none)
+    center_x += base_size * shift_x
+    center_y += base_size * shift_y
+
+    proc_size = base_size / scale_aug
+
+    dst_size = target_size
+    dst_center = dst_size / 2.0
+    scale_ratio = dst_size / proc_size
+
+    M = cv2.getRotationMatrix2D((center_x, center_y), rot, scale_ratio)
+    M[0, 2] += dst_center - center_x
+    M[1, 2] += dst_center - center_y
+
+    return M
 
 
 def run_inference(image_name=None):
@@ -121,8 +157,74 @@ def run_inference(image_name=None):
         K_mat[0],  # Pass the original K
     )
 
+    # --- Landmark Visualization ---
+    print("Drawing landmarks...")
+
+    # 1. Start with original image
+    lm_img = original_img_bgr.copy()
+
+    # 2. Get Affine Transform used for cropping (Inverse needed)
+    M = get_affine_transform(meta, target_size=256)
+
+    # 3. Process Landmarks
+    # p_ldmk is [1, 1378, 3] (x, y, log_var)
+    # x,y are normalized [0, 1] in crop space.
+    pred_ldmk_cpu = p_ldmk[0].cpu().numpy()
+
+    pts_crop = pred_ldmk_cpu[:, :2] * 256.0  # Scale to crop pixels [N, 2]
+    log_var = pred_ldmk_cpu[:, 2]
+
+    print(
+        f"Log Var Stats: Min={log_var.min():.3f}, Max={log_var.max():.3f}, Mean={log_var.mean():.3f}"
+    )
+
+    # Inverse Transform to Original Image Space
+    # cv2.transform expects points as [N, 1, 2]
+    # Invert M
+    M_inv = cv2.invertAffineTransform(M)
+    pts_orig = cv2.transform(pts_crop.reshape(-1, 1, 2), M_inv).squeeze()  # [N, 2]
+
+    # 4. Draw Dots
+    # Confidence Heuristic: High log_var = Low Cert. Low log_var = High Cert.
+    # log_var generally ranges from -4 (confident) to +4 (uncertain).
+    # Convert to 0-1 score where 1 is good (Green)
+    # score = exp(-0.5 * exp(log_var)) ? No, simply map log_var.
+    # Let's trust that smaller variance is better.
+    # Map [-5, 0] to Color.
+
+    # Fixed Range Normalization based on losses.py analysis
+    # log_var is ln(sigma^2).
+    # 0.0 -> sigma=1px (Good/Green)
+    # 5.0 -> sigma=12px (Bad/Red)
+    min_val = 0.0
+    max_val = 5.0
+
+    for i in range(pts_orig.shape[0]):
+        x, y = int(pts_orig[i, 0]), int(pts_orig[i, 1])
+        conf = log_var[i]
+
+        # Normalize
+        factor = (conf - min_val) / (max_val - min_val)
+        factor = np.clip(factor, 0.0, 1.0)
+
+        # BGR
+        # Good (0) -> Green (0,255,0)
+        # Bad (1) -> Red (0,0,255)
+        # B: 0
+        # G: 255 * (1 - factor)
+        # R: 255 * factor
+        color = (0, int(255 * (1 - factor)), int(255 * factor))
+
+        cv2.circle(lm_img, (x, y), 2, color, -1)
+
+    # 5. Concatenate Side-by-Side
+    # Ensure same height (they match because both are from original_img_bgr)
+    # Add a small black separator line?
+    sep = np.zeros((vis_img.shape[0], 10, 3), dtype=np.uint8)
+    combined = np.hstack([vis_img, sep, lm_img])
+
     print("Displaying result (Press any key to close)...")
-    cv2.imshow("Inference Result", vis_img)
+    cv2.imshow("Inference Result (Left: Mesh, Right: Landmarks)", combined)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
