@@ -32,7 +32,7 @@ class HMRLoss(nn.Module):
         self.w_dense = 10.0
         self.w_pose = 1.0
         self.w_shape = 1.0
-        self.w_joint_t = 5.0
+        self.w_joint_t = 2.0
         self.w_joint_r = 1.0
 
         self.l1 = nn.L1Loss()
