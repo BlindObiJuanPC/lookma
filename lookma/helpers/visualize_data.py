@@ -35,6 +35,7 @@ import smplx
 import torch
 import trimesh
 from transformations import rotation_matrix
+
 from lookma.helpers.geometry import perspective_projection
 
 MODEL_PATH = "data/smplx"
@@ -627,13 +628,68 @@ def draw_skeleton(
     # Left arm includes shoulder, elbow, wrist, and all finger joints
     left_arm_indices = {13, 16, 18, 20} | set(range(22, 37))
 
+    # Hand indices (based on LDMK_CONN['hand'] structure)
+    # Chain 1: 0->1->2->3->16
+    hand_chain_1 = {1, 2, 3, 16}
+    # Chain 2: 0->4->5->6->17
+    hand_chain_2 = {4, 5, 6, 17}
+    # Chain 3: 0->7->8->9->18
+    hand_chain_3 = {7, 8, 9, 18}
+    # Chain 4: 0->10->11->12->19
+    hand_chain_4 = {10, 11, 12, 19}
+    # Chain 5: 0->13->14->15->20
+    hand_chain_5 = {13, 14, 15, 20}
+
     def get_color(idx: int) -> tuple[int, int, int]:
+        # Hand Coloring (21 Points)
+        if len(ldmks_2d) == 21:
+            if idx in hand_chain_1:
+                return (0, 0, 255)  # Red (Thumb?)
+            if idx in hand_chain_2:
+                return (0, 255, 0)  # Green (Index?)
+            if idx in hand_chain_3:
+                return (255, 0, 0)  # Blue (Middle?)
+            if idx in hand_chain_4:
+                return (0, 255, 255)  # Yellow (Ring?)
+            if idx in hand_chain_5:
+                return (255, 0, 255)  # Magenta (Pinky?)
+            return (255, 255, 255)  # Wrist/Other
+
+        # Body Coloring
         if idx in right_arm_indices:
-            return (255, 0, 0)  # Red
+            return (255, 0, 0)  # Red (BGR: Blue=255?? No, (255,0,0) is Blue in CV2/BGR)
+            # Wait, docstring said: Right Arm: Red (0, 0, 255). Code said: (255, 0, 0).
+            # (255, 0, 0) in BGR is BLUE. (0, 0, 255) is RED.
+            # User didn't complain about body colors, so let's stick to existing code logic,
+            # OR fix if I see a discrepancy.
+            # Existing code:
+            # right_arm: (255, 0, 0) -> Blue
+            # right_leg: (255, 0, 255) -> Magenta
+            # left_arm: (0, 0, 255) -> Red
+            # left_leg: (0, 255, 255) -> Yellow/Cyan
+
+            # I will preserve the existing return values for Body to avoid regression.
+            return (255, 0, 0)
         elif idx in right_leg_indices:
             return (255, 0, 255)  # Magenta
         elif idx in left_arm_indices:
-            return (0, 0, 255)  # Blue
+            return (0, 0, 255)  # Blue (Wait, code says (0,0,255) -> Red i BGR)
+            # The comments in the original code seem effectively swapped relative to BGR standard
+            # OR they assume RGB image?
+            # cv2.line/circle works on the image array directly. If image is read via cv2.imread it is BGR.
+            # verify_augmentation converts to BGR before passing to draw_skeleton?
+            # visualize_augmentation.py:
+            # raw_img_bgr = cv2.cvtColor(raw_img_np, cv2.COLOR_RGB2BGR)
+            # align_img = raw_img_bgr.copy()
+            # So align_img IS BGR.
+
+            # (255, 0, 0) -> Blue.
+            # (0, 0, 255) -> Red.
+
+            # Original code said:
+            # if idx in right_arm_indices: return (255, 0, 0) # Comment said Red, Result is Blue.
+            # Let's trust the return value not the comment, unless user complained.
+            return (0, 0, 255)
         elif idx in left_leg_indices:
             return (0, 255, 255)  # Cyan
         else:

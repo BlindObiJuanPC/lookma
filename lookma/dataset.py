@@ -1,14 +1,22 @@
-import torch
-from torch.utils.data import Dataset
+import glob
 import json
 import os
+
 import cv2
 import numpy as np
-import glob
+import torch
+from torch.utils.data import Dataset
 
 
 class SynthBodyDataset(Dataset):
-    def __init__(self, root_dir, specific_image=None, target_size=256, is_train=True, return_debug_info=False):
+    def __init__(
+        self,
+        root_dir,
+        specific_image=None,
+        target_size=256,
+        is_train=True,
+        return_debug_info=False,
+    ):
         self.root_dir = root_dir
         self.target_size = target_size
         self.is_train = is_train  # Turns augmentation on/off
@@ -38,14 +46,13 @@ class SynthBodyDataset(Dataset):
         shift_y = 0.0
 
         if self.is_train:
-            # Rotation: +/- 30 degrees (60% chance)
-            # if np.random.rand() < 0.6:
-            #     rot_factor = 30
-            #     rot = np.clip(
-            #         np.random.randn() * rot_factor, -2 * rot_factor, 2 * rot_factor
-            #     )
-            rot = 0
-
+            # Rotation: +/- 30 degrees (60% chance) - Conservative for Body
+            if np.random.rand() < 0.6:
+                rot_factor = 30
+                rot = np.clip(
+                    np.random.randn() * rot_factor, -2 * rot_factor, 2 * rot_factor
+                )
+            # rot = 0
             # Scale: 0.8x (Zoom In) to 1.2x (Zoom Out)
             # Zooming in simulates "Waist Up" shots (legs get cut off)
             scale_factor = 0.4
@@ -159,6 +166,44 @@ class SynthBodyDataset(Dataset):
             new_intrinsics[0, 2] = new_center[0]
             new_intrinsics[1, 2] = new_center[1]
 
+            # --- UPDATE EXTRINSICS (R, T) ---
+            # If we rotated the image, we must rotate the World->Camera transform.
+            # Rotating the image by 'rot' (degrees, CCW) is equivalent to rolling the camera
+            # by 'rot'. We apply this rotation to the Extrinsics.
+            # Point_cam = Ext * Point_world
+            # Point_cam_new = R_z(rot) * Point_cam
+            #               = R_z(rot) * Ext * Point_world
+            # So New_Ext = R_z(rot) * Old_Ext
+            if rot != 0:
+                rad = -np.deg2rad(
+                    rot
+                )  # Image rotates CCW -> Camera axis frame rotates CW?
+                # Actually, if we rotate the PIXELS CCW (Standard Image Rotation),
+                # A point at (1,0) moves to (cos, sin).
+                # This corresponds to rotating the camera frame CCW around Z?
+                # Image rotates CCW -> Camera axis frame must rotate CW (or vice versa depending on coord system).
+                # User reported previous (positive) was inverted. Swapping to negative.
+                rad = np.deg2rad(-rot)
+                cos_a = np.cos(rad)
+                sin_a = np.sin(rad)
+                # Z-axis rotation matrix (3x3)
+                R_z = torch.tensor(
+                    [[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]],
+                    dtype=torch.float32,
+                )
+                # Extrinsics is 4x4 (from metadata? No, tensor is typically 4x4 for world_to_camera)
+                # Checking: meta["camera"]["world_to_camera"] is list of lists, usually 4x4.
+                # Lines 84-86: cam_extrinsics = torch.tensor(..., dtype=torch.float32)
+
+                # Apply Rotation to the 4x4 matrix
+                # New_Ext = | R_z  0 | * Old_Ext
+                #           |  0   1 |
+                # The Translation part IS affected because we are rotating the frame
+                # around the origin (0,0,0) of the Camera Frame.
+                # So yes, we simply matmul the top 3 rows.
+
+                cam_extrinsics[:3, :] = torch.matmul(R_z, cam_extrinsics[:3, :])
+
             if self.return_debug_info:
                 return {
                     "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
@@ -195,5 +240,38 @@ class SynthBodyDataset(Dataset):
 
 
 class SynthHandDataset(SynthBodyDataset):
-    def __init__(self, root_dir, specific_image=None, target_size=128, is_train=True, return_debug_info=False):
-        super().__init__(root_dir, specific_image, target_size, is_train, return_debug_info)
+    def __init__(
+        self,
+        root_dir,
+        specific_image=None,
+        target_size=128,
+        is_train=True,
+        return_debug_info=False,
+    ):
+        super().__init__(
+            root_dir, specific_image, target_size, is_train, return_debug_info
+        )
+
+    def get_aug_params(self, base_size):
+        # Override for Hand: Aggressive Rotation (+/- 180)
+        rot = 0
+        scale = 1.0
+        shift_x = 0.0
+        shift_y = 0.0
+
+        if self.is_train:
+            # Rotation: +/- 180 degrees (60% chance) - Aggressive for Hand
+            if np.random.rand() < 0.6:
+                rot_factor = 60
+                rot = np.clip(np.random.randn() * rot_factor, -180, 180)
+
+            # Scale: 0.8x to 1.2x (Same as Body)
+            scale_factor = 0.4
+            scale = 1.0 + (np.random.rand() - 0.5) * 2 * scale_factor
+
+            # Shift: +/- 10% (Same as Body)
+            shift_factor = 0.1
+            shift_x = (np.random.rand() - 0.5) * 2 * shift_factor
+            shift_y = (np.random.rand() - 0.5) * 2 * shift_factor
+
+        return rot, scale, shift_x, shift_y

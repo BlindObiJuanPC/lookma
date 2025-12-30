@@ -4,11 +4,14 @@ import sys
 
 import cv2
 import numpy as np
+import torch
 
 # Add project root to sys.path
 sys.path.append(os.getcwd())
 
 from lookma.dataset import SynthBodyDataset, SynthHandDataset
+from lookma.helpers.augmentation import TrainingAugmentation
+from lookma.helpers.visualize_data import draw_mesh, draw_skeleton, LDMK_CONN
 
 
 def main():
@@ -48,6 +51,11 @@ def main():
     print(f"Dataset length: {len(dataset)}")
     print("Press 'n' for next image, 'q' to quit.")
 
+    # Initialize GPU Augmentation
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    augmentor = TrainingAugmentation().to(device)
+    print(f"Using device: {device}")
+
     # Indices to shuffle through
     indices = np.arange(len(dataset))
     np.random.shuffle(indices)
@@ -59,83 +67,181 @@ def main():
             print(f"Error loading index {idx}: {e}")
             continue
 
-        # Processed Image (Tensor -> Numpy -> uint8)
-        # Tensor is (3, H, W) float
-        proc_img_tensor = item["image"]
-        proc_img_np = proc_img_tensor.permute(1, 2, 0).numpy()
-        proc_img_np = np.clip(proc_img_np, 0, 255).astype(np.uint8)
-        proc_img_np = cv2.cvtColor(proc_img_np, cv2.COLOR_RGB2BGR)
+        # item["image"] is Tensor (3, H, W) [0-255].
+        # We need [0, 1] for augmentation.
+        raw_img = (
+            (item["image"].float() / 255.0).to(device).unsqueeze(0)
+        )  # [1, 3, H, W]
 
-        # Original Image is RGB (from dataset), convert to BGR for OpenCV
-        orig_img = item["original_image"]
-        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_RGB2BGR)
+        # Apply Augmentation
+        aug_img_tensor, debug_info = augmentor(raw_img, return_debug_info=True)
 
-        # Aug Params
-        aug_params = item["aug_params"]
+        # Convert back to uint8 BGR for display
+        # Raw Image (from Dataset, before GPU aug)
+        raw_img_np = (raw_img.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255).astype(
+            np.uint8
+        )
+        raw_img_bgr = cv2.cvtColor(raw_img_np, cv2.COLOR_RGB2BGR)
+
+        # Augmented Image
+        aug_img_np = (
+            aug_img_tensor.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255
+        ).astype(np.uint8)
+        aug_img_bgr = cv2.cvtColor(aug_img_np, cv2.COLOR_RGB2BGR)
+
+        # Original Clean (Before Dataset Crop/Aug)
+        orig_clean = item["original_image"]
+        orig_clean_bgr = cv2.cvtColor(orig_clean, cv2.COLOR_RGB2BGR)
+
+        # Alignment Visualization: Mesh Mask
+        align_img = raw_img_bgr.copy()
+        try:
+            align_vis = draw_mesh(
+                align_img,
+                item["betas"].numpy(),
+                item["pose"].numpy(),
+                item["trans"].numpy(),
+                item["cam_extrinsics"].numpy(),
+                item["cam_intrinsics"].numpy(),
+            )
+            # Also draw skeleton on top
+            # landmarks_2d is tensor -> numpy
+            ldmks = item["landmarks_2d"].numpy()
+
+            # Select proper connectivity
+            conn_key = "hand" if args.dataset == "hand" else "body"
+            draw_skeleton(align_vis, ldmks, LDMK_CONN[conn_key], thickness=1)
+
+        except Exception as e:
+            print(f"Mesh draw failed: {e}")
+            align_vis = np.zeros_like(align_img)
 
         # Visualization Layout
-        h_orig, w_orig = orig_img.shape[:2]
-        h_proc, w_proc = proc_img_np.shape[:2]
+        h_disp = 512
 
-        # Target height for display (e.g. 512)
-        disp_h = 512
-        scale_orig = disp_h / h_orig
-        scale_proc = disp_h / h_proc
+        # Scale all to h_disp
+        def resize_h(img, target_h):
+            h, w = img.shape[:2]
+            scale = target_h / h
+            return cv2.resize(img, (int(w * scale), target_h))
 
-        orig_disp = cv2.resize(orig_img, (int(w_orig * scale_orig), disp_h))
-        proc_disp = cv2.resize(proc_img_np, (int(w_proc * scale_proc), disp_h))
+        disp_clean = resize_h(orig_clean_bgr, h_disp)
+        disp_raw = resize_h(raw_img_bgr, h_disp)
+        disp_align = resize_h(align_vis, h_disp)
+        disp_aug = resize_h(aug_img_bgr, h_disp)
 
-        # Concatenate
-        combined = np.hstack([orig_disp, proc_disp])
+        # Concatenate: [Original Full] | [Dataset Crop] | [GPU Aug] | [Align Check]
+        combined = np.hstack([disp_clean, disp_raw, disp_aug, disp_align])
 
-        # Text Settings
+        # Draw Text
         font = cv2.FONT_HERSHEY_DUPLEX
         font_scale = 0.5
         line_spacing = 20
         color = (0, 0, 255)  # Red
-        thickness = 1
 
-        # Start drawing text on the augmented image side
-        # x_offset is width of original image
-        x_start = orig_disp.shape[1] + 10
-        y_start = 20
+        # Determine x start positions
+        x_clean = 10
+        x_raw = disp_clean.shape[1] + 10
+        x_aug = disp_clean.shape[1] + disp_raw.shape[1] + 10
+        x_align = disp_clean.shape[1] + disp_raw.shape[1] + disp_aug.shape[1] + 10
 
-        # Draw Augmentation Params (multiline)
-        lines = [
-            f"Rot: {aug_params['rot']:.1f}",
-            f"Scale: {aug_params['scale']:.2f}",
-            f"Shift X: {aug_params['shift_x']:.2f}",
-            f"Shift Y: {aug_params['shift_y']:.2f}",
+        y_start = 30
+
+        # Labels
+        cv2.putText(
+            combined, "Raw Source", (x_clean, h_disp - 10), font, 0.6, (0, 255, 0), 1
+        )
+        cv2.putText(
+            combined, "Dataset Crop", (x_raw, h_disp - 10), font, 0.6, (0, 255, 0), 1
+        )
+        cv2.putText(
+            combined,
+            "Mesh Alignment",
+            (x_align, h_disp - 10),
+            font,
+            0.6,
+            (0, 255, 0),
+            1,
+        )
+        cv2.putText(
+            combined,
+            "GPU Augmentation",
+            (x_aug, h_disp - 10),
+            font,
+            0.6,
+            (0, 255, 0),
+            1,
+        )
+
+        # Print Aug params
+        # Dataset Aug Params
+        ds_aug = item["aug_params"]
+        ds_lines = [
+            f"Rot: {ds_aug['rot']:.1f}",
+            f"Scale: {ds_aug['scale']:.2f}",
+            f"Shift X: {ds_aug['shift_x']:.2f}",
+            f"Shift Y: {ds_aug['shift_y']:.2f}",
         ]
 
-        for i, line in enumerate(lines):
+        for i, line in enumerate(ds_lines):
             cv2.putText(
                 combined,
                 line,
-                (x_start, y_start + i * line_spacing),
+                (x_raw, y_start + i * line_spacing),
                 font,
                 font_scale,
                 color,
-                thickness,
+                1,
             )
 
-        # Labels
-        cv2.putText(combined, "Original", (10, disp_h - 10), font, 0.6, (0, 255, 0), 1)
-        cv2.putText(
-            combined, "Augmented", (x_start, disp_h - 10), font, 0.6, (0, 255, 0), 1
-        )
+        # GPU Aug Params
+        gpu_lines = []
 
-        # Instructions (Small text)
-        cv2.putText(
-            combined, "n: next, q: quit", (10, 20), font, 0.4, (255, 255, 255), 1
-        )
+        # Color Jitter
+        cj = debug_info["color_jitter"]
+        if cj["brightness"]:
+            gpu_lines.append(f"Bright: {cj['brightness']:.2f}")
+        if cj["contrast"]:
+            gpu_lines.append(f"Contr: {cj['contrast']:.2f}")
+        if cj["saturation"]:
+            gpu_lines.append(f"Sat: {cj['saturation']:.2f}")
+        if cj["hue"]:
+            gpu_lines.append(f"Hue: {cj['hue']:.2f}")
+
+        # ISO Noise
+        iso = debug_info["iso_noise"]
+        if iso["applied"]:
+            gpu_lines.append("ISO Noise: ON")
+            gpu_lines.append(f" Sigma: {iso['sigma_read']:.4f}")
+            gpu_lines.append(f" Gain: {iso['gain']:.4f}")
+        else:
+            gpu_lines.append("ISO Noise: OFF")
+
+        # Pixelate
+        pix = debug_info["pixelate"]
+        if pix["applied"]:
+            gpu_lines.append(f"Pixelate: ON (1/{pix['downsample_factor']})")
+        else:
+            gpu_lines.append("Pixelate: OFF")
+
+        for i, line in enumerate(gpu_lines):
+            cv2.putText(
+                combined,
+                line,
+                (x_aug, y_start + i * line_spacing),
+                font,
+                font_scale,
+                color,
+                1,
+            )
 
         cv2.imshow("Augmentation Visualization", combined)
 
-        # Poll for key press or window close
+        # Loop with polling to handle Window Close ('X')
         user_quit = False
         next_img = False
         while True:
+            # Check if window was closed
             if (
                 cv2.getWindowProperty(
                     "Augmentation Visualization", cv2.WND_PROP_VISIBLE
@@ -145,11 +251,14 @@ def main():
                 user_quit = True
                 break
 
-            key = cv2.waitKey(100) & 0xFF
-            if key == ord("q"):
+            key = cv2.waitKey(100)
+            if key == -1:
+                continue
+
+            if key == ord("q") or key == 27:  # q or Esc
                 user_quit = True
                 break
-            elif key == ord("n"):
+            elif key == ord("n") or key == 32:  # n or Space
                 next_img = True
                 break
 

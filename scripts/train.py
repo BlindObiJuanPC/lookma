@@ -3,14 +3,13 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lookma.dataset import SynthBodyDataset
+from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
 from lookma.losses import HMRLoss
@@ -29,33 +28,6 @@ NUM_IMAGES = None  # ALL 95,000 IMAGES
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- AUGMENTATION ---
-color_aug = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-
-
-class AddISONoise(nn.Module):
-    def forward(self, img):
-        if torch.rand(1) > 0.5:
-            return img
-        sigma_read = torch.rand(1, device=img.device) * 0.03
-        gain = torch.rand(1, device=img.device) * 0.03
-        shot_std = torch.sqrt(torch.clamp(img, min=1e-5)) * gain
-        return torch.clamp(
-            img + torch.randn_like(img) * sigma_read + torch.randn_like(img) * shot_std,
-            0,
-            1,
-        )
-
-
-class Pixelate(nn.Module):
-    def forward(self, img):
-        if torch.rand(1) < 0.3:
-            B, C, H, W = img.shape
-            factor = np.random.randint(2, 4)
-            small = torch.nn.functional.interpolate(
-                img, scale_factor=1 / factor, mode="nearest"
-            )
-            return torch.nn.functional.interpolate(small, size=(H, W), mode="nearest")
-        return img
 
 
 def save_debug_image(
@@ -137,8 +109,7 @@ def train():
     criterion = HMRLoss("data/smplx", device=DEVICE)
     scaler = GradScaler("cuda")
 
-    gpu_iso = AddISONoise().to(DEVICE)
-    gpu_pixel = Pixelate().to(DEVICE)
+    gpu_aug = TrainingAugmentation().to(DEVICE)
 
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
@@ -164,9 +135,7 @@ def train():
         for batch_idx, batch in enumerate(progress_bar):
             raw_imgs = batch["image"].to(DEVICE, non_blocking=True) / 255.0
             if epoch >= 2:
-                raw_imgs = color_aug(raw_imgs)
-                raw_imgs = gpu_iso(raw_imgs)
-                raw_imgs = gpu_pixel(raw_imgs)
+                raw_imgs = gpu_aug(raw_imgs)
 
             norm_imgs = TF.normalize(
                 raw_imgs, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
