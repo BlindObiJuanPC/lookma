@@ -1,5 +1,5 @@
 import os
-
+import argparse
 import cv2
 import numpy as np
 import torch
@@ -8,55 +8,93 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from lookma.dataset import SynthBodyDataset
+from lookma.dataset import SynthBodyDataset, SynthHandDataset
 from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
-from lookma.losses import BodyLoss
-from lookma.models import BodyNetwork
+from lookma.losses import BodyLoss, HandLoss
+from lookma.models import BodyNetwork, HandNetwork
 
-# --- FINAL PRODUCTION CONFIG (RTX 5090) ---
-BATCH_SIZE = 128  # Calculated from a VRAM stress test
-ACCUMULATION_STEPS = 2  # 128 * 2 = 256 Effective Batch (Official Paper Spec)
-LEARNING_RATE = 1e-4  # Official Paper Spec
-NUM_EPOCHS = 60  # Long-form convergence
-SAVE_INTERVAL = 1
-VIS_INTERVAL = 500
-NUM_WORKERS = 12  # 5090 needs fast CPU feeding to stay busy
-NUM_IMAGES = None  # ALL 95,000 IMAGES
-
+# --- CONFIGURATION (RTX 5090) ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- AUGMENTATION ---
+CONFIGS = {
+    "body": {
+        "batch_size": 128,
+        "acc_steps": 2,  # Effective 256
+        "lr": 1e-4,
+        "epochs": 600,
+        "target_size": 256,
+        "dataset_cls": SynthBodyDataset,
+        "data_path": "data/synth_body",
+        "model_cls": BodyNetwork,
+        "backbone": "hrnet_w48",
+        "loss_cls": BodyLoss,
+        "num_workers": 12,
+        "has_shape": True,
+    },
+    "hand": {
+        "batch_size": 256,  # Smaller image size (128) allows larger batch
+        "acc_steps": 1,  # Effective 256
+        "lr": 1e-4,
+        "epochs": 600,
+        "target_size": 128,  # ROI for hand is smaller
+        "dataset_cls": SynthHandDataset,
+        "data_path": "data/synth_hand",
+        "model_cls": HandNetwork,
+        "backbone": "hrnet_w18",  # Lighter backbone
+        "loss_cls": HandLoss,
+        "num_workers": 12,
+        "has_shape": False,
+    },
+}
 
 
 def save_debug_image(
     image_tensor,
     pred_pose,
-    pred_shape,
-    gt_pose,
-    gt_world_t,
-    cam_ext,
-    K_mat,
+    pred_shape,  # Can be None
+    batch,  # Contains all GT data
     epoch,
     batch_idx,
+    is_hand=False,
 ):
     with torch.no_grad():
+        # Extact GT data from batch
+        gt_pose = batch["pose"].to(DEVICE)
+        gt_betas = batch["betas"].to(DEVICE)
+        gt_world_t = batch["trans"].to(DEVICE)
+        cam_ext = batch["cam_extrinsics"].to(DEVICE)
+        K_mat = batch["cam_intrinsics"].to(DEVICE)
+
         # --- FIX: Cast to .float() to prevent Half/Float mismatch in Mixed Precision ---
-        p_pose_single = pred_pose[0:1].float()
-        p_shape_single = pred_shape[0:1].float()
+        p_pose_single = pred_pose[0:1].float()  # [1, 90 or 126]
+
+        if pred_shape is not None:
+            p_shape_single = pred_shape[0:1].float()
+        else:
+            # Fallback to GT shape if prediction is missing (e.g. for Hand network)
+            p_shape_single = gt_betas[0:1].float()
+
         p_trans_single = gt_world_t[0:1].float()
 
-        # Prediction to Matrices [1, 21, 3, 3] (Body Only)
-        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))
-
         # Hybrid Pose Construction (Match Loss Logic)
-        # GT Pose is [B, 52, 3] (Axis Angle) -> [B, 52, 3, 3] (RotMat) for easy blending
+        # GT Pose is [B, 52, 3] (Axis Angle)
         gt_rotmat = batch_rodrigues(gt_pose[0:1].view(1, 52, 3))
 
-        # Clone GT and overwrite Body joints (1-21) with Prediction
+        # Clone GT and overwrite
         full_rotmat = gt_rotmat.clone()
-        full_rotmat[0, 1:22] = p_rotmat[0]
+
+        if not is_hand:
+            # Body: Pred Pose is [1, 126] (21 joints * 6D)
+            # Overwrite indices 1-21
+            p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))
+            full_rotmat[0, 1:22] = p_rotmat[0]
+        else:
+            # Hand: Pred Pose is [1, 90] (15 joints * 6D)
+            # Overwrite indices 22-37 (Left Hand)
+            p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 15, 6))
+            full_rotmat[0, 22:37] = p_rotmat[0]
 
         # Convert Hybrid Matrices to Axis-Angle for draw_mesh
         rots_np = full_rotmat[0].cpu().numpy()  # [52, 3, 3]
@@ -71,7 +109,6 @@ def save_debug_image(
 
         # Call Visualizer
         # We pass GT World Translation + Camera Extrinsics
-        # draw_mesh will run: Verts = SMPL(Pose, Trans); Render(Verts, Ext)
         vis_img = draw_mesh(
             img_bgr,
             p_shape_single[0].cpu().numpy(),
@@ -81,37 +118,48 @@ def save_debug_image(
             K_mat[0].cpu().numpy(),
         )
 
-        os.makedirs("experiments/vis", exist_ok=True)
-        cv2.imwrite(f"experiments/vis/train_e{epoch}_b{batch_idx}.jpg", vis_img)
+        folder_name = "train_hand" if is_hand else "train_body"
+        os.makedirs(f"experiments/vis/{folder_name}", exist_ok=True)
+        cv2.imwrite(f"experiments/vis/{folder_name}/e{epoch}_b{batch_idx}.jpg", vis_img)
 
 
-def train():
+def train(args):
+    cfg = CONFIGS[args.type]
+
     print(
-        f"PRODUCTION RUN STARTING | Batch: {BATCH_SIZE} | Eff: {BATCH_SIZE * ACCUMULATION_STEPS}"
+        f"RUNNING {args.type.upper()} TRAINING | Batch: {cfg['batch_size']} | Eff: {cfg['batch_size'] * cfg['acc_steps']}"
     )
-    os.makedirs("experiments/checkpoints", exist_ok=True)
 
-    dataset = SynthBodyDataset("data/synth_body", target_size=256, is_train=True)
+    # Checkpoint Dir
+    ckpt_dir = f"experiments/checkpoints/{args.type}"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    dataset = cfg["dataset_cls"](
+        cfg["data_path"], target_size=cfg["target_size"], is_train=True
+    )
     loader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=cfg["batch_size"],
         shuffle=True,
-        num_workers=NUM_WORKERS,
+        num_workers=cfg["num_workers"],
         pin_memory=True,
         drop_last=True,
     )
 
-    model = BodyNetwork(backbone_name="hrnet_w48").to(DEVICE)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
+    model = cfg["model_cls"](backbone_name=cfg["backbone"]).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg["epochs"]
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-    criterion = BodyLoss("data/smplx", device=DEVICE)
+    criterion = cfg["loss_cls"]("data/smplx", device=DEVICE)
     scaler = GradScaler("cuda")
 
     gpu_aug = TrainingAugmentation().to(DEVICE)
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    save_interval = 1
+    vis_interval = 500
+
+    for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         total_loss = 0.0
         optimizer.zero_grad()
@@ -125,10 +173,10 @@ def train():
                 param.requires_grad = True
             # Re-init optimizer so it sees the new parameters
             optimizer = torch.optim.AdamW(
-                model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
+                model.parameters(), lr=cfg["lr"], weight_decay=1e-4
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=NUM_EPOCHS - 1
+                optimizer, T_max=cfg["epochs"] - 1
             )
 
         progress_bar = tqdm(loader, desc=f"Epoch {epoch}")
@@ -149,56 +197,95 @@ def train():
             )[:, :3, 0]
 
             with autocast("cuda"):
-                p_pose, p_shape, p_ldmk = model(norm_imgs)
-                loss, comps, _ = criterion(
-                    p_pose,
-                    p_shape,
-                    p_ldmk,
-                    batch["pose"].to(DEVICE),
-                    batch["betas"].to(DEVICE),
-                    gt_cam_t,
-                    batch["cam_intrinsics"].to(DEVICE),
-                    ext,
-                )
-                loss = loss / ACCUMULATION_STEPS
+                # Forward Pass Switch
+                if cfg["has_shape"]:
+                    p_pose, p_shape, p_ldmk = model(norm_imgs)
+                    loss, comps, _ = criterion(
+                        p_pose,
+                        p_shape,
+                        p_ldmk,
+                        batch["pose"].to(DEVICE),
+                        batch["betas"].to(DEVICE),
+                        gt_cam_t,
+                        batch["cam_intrinsics"].to(DEVICE),
+                        ext,
+                    )
+                else:
+                    p_pose, p_ldmk = model(norm_imgs)
+                    p_shape = None
+                    loss, comps, _ = criterion(
+                        p_pose,
+                        p_ldmk,
+                        batch["pose"].to(DEVICE),
+                        gt_cam_t,
+                        batch["cam_intrinsics"].to(DEVICE),
+                        ext,
+                        batch["betas"].to(DEVICE),  # gt_shape required for HandLoss
+                    )
+
+                loss = loss / cfg["acc_steps"]
 
             scaler.scale(loss).backward()
-            if (batch_idx + 1) % ACCUMULATION_STEPS == 0:
+            if (batch_idx + 1) % cfg["acc_steps"] == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            total_loss += loss.item() * ACCUMULATION_STEPS
+            total_loss += loss.item() * cfg["acc_steps"]
             progress_bar.set_postfix(
                 {
-                    "Loss": f"{loss.item() * ACCUMULATION_STEPS:.2f}",
+                    "Loss": f"{loss.item() * cfg['acc_steps']:.2f}",
                     "J3D": f"{comps['loss_joint_t']:.3f}",
+                    "Dense": f"{comps['loss_dense']:.3f}",
                 }
             )
 
-            if batch_idx % VIS_INTERVAL == 0:
+            if batch_idx % vis_interval == 0:
                 save_debug_image(
                     raw_imgs,
                     p_pose,
                     p_shape,
-                    batch["pose"].to(DEVICE),
-                    gt_world_t,
-                    ext,
-                    batch["cam_intrinsics"],
+                    batch,
                     epoch,
                     batch_idx,
+                    is_hand=(not cfg["has_shape"]),
                 )
+
+            if args.dry_run:
+                print("Dry run complete (1 batch)")
+                break
+
+        if args.dry_run:
+            break
 
         scheduler.step()
         learning_rate = scheduler.get_last_lr()[0]
         average_loss = total_loss / len(loader)
         print(f"Epoch {epoch} Avg Loss: {average_loss:.4f} | LR: {learning_rate:.6f}")
-        torch.save(
-            model.state_dict(), f"experiments/checkpoints/model_epoch_{epoch}.pth"
-        )
+
+        if epoch % save_interval == 0:
+            torch.save(model.state_dict(), f"{ckpt_dir}/model_epoch_{epoch}.pth")
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--type",
+        type=str,
+        default="body",
+        choices=["body", "hand"],
+        help="Training type: body or hand",
+    )
+    parser.add_argument(
+        "--dry_run", action="store_true", help="Run a single batch for debugging"
+    )
+    args = parser.parse_args()
+
+    # Simple hack for dry run: just interrupt loop?
+    # Or cleaner: if dry_run, break after 1 step.
+    # For now, I'll rely on the user running it and Ctrl+C if needed or maybe I'll add logic later.
+    # Actually, let's keep it simple.
+
+    train(args)
