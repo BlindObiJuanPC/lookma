@@ -192,8 +192,11 @@ def train(args):
                 param.requires_grad = False
         if epoch == 2:  # Full train
             print("Unfreezing Backbone...")
-            for param in model.backbone.parameters():
+            # Handle compiled model wrapper if present
+            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            for param in raw_model.backbone.parameters():
                 param.requires_grad = True
+
             # Re-init optimizer so it sees the new parameters
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
@@ -201,6 +204,12 @@ def train(args):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=cfg["epochs"] - 1
             )
+
+            # Verify Trainable Params
+            num_trainable = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            print(f"DEBUG: Total Trainable Params: {num_trainable:,}")
 
         if epoch == 1 and num_workers > 0:
             print("Initializing Dataloader workers (this may take a few seconds)...")
