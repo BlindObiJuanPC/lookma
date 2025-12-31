@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -152,7 +152,7 @@ def train(args):
         optimizer, T_max=cfg["epochs"]
     )
     criterion = cfg["loss_cls"]("data/smplx", device=DEVICE)
-    scaler = GradScaler("cuda")
+    # GradScaler not needed for BF16
 
     gpu_aug = TrainingAugmentation().to(DEVICE)
 
@@ -196,7 +196,7 @@ def train(args):
                 ext, torch.cat([gt_world_t.unsqueeze(-1), ones], dim=1)
             )[:, :3, 0]
 
-            with autocast("cuda"):
+            with autocast("cuda", dtype=torch.bfloat16):
                 # Forward Pass Switch
                 if cfg["has_shape"]:
                     p_pose, p_shape, p_ldmk = model(norm_imgs)
@@ -225,12 +225,10 @@ def train(args):
 
                 loss = loss / cfg["acc_steps"]
 
-            scaler.scale(loss).backward()
+            loss.backward()
             if (batch_idx + 1) % cfg["acc_steps"] == 0:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
 
             total_loss += loss.item() * cfg["acc_steps"]
