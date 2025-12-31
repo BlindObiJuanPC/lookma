@@ -203,9 +203,9 @@ def train(args):
             for param in raw_model.backbone.parameters():
                 param.requires_grad = True
 
-            # Re-init optimizer so it sees the new parameters
+            # Re-init optimizer on the RAW model parameters to ensure we get the updated requires_grad state
             optimizer = torch.optim.AdamW(
-                model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
+                raw_model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=cfg["epochs"] - 1
