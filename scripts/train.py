@@ -26,8 +26,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 CONFIGS = {
     "body": {
-        "batch_size": 256,
-        "acc_steps": 1,
+        "batch_size": 128,
+        "acc_steps": 2,
         "lr": 1e-4,
         "epochs": 600,
         "target_size": 256,
