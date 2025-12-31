@@ -343,4 +343,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.compile:
+        # User requested constant feedback on recompilation
+        os.environ["TORCH_LOGS"] = "recompiles"
+
     train(args)
