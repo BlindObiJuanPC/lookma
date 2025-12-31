@@ -428,18 +428,15 @@ def _render_mesh(
     return rendered_img.astype(float) / 255
 
 
-def draw_mesh(
-    image: np.ndarray,
+def get_smplh_vertices(
     identity: np.ndarray,
     pose: np.ndarray,
     translation: np.ndarray,
-    world_to_cam: np.ndarray,
-    cam_to_img: np.ndarray,
-) -> None:
-    """Draw a mesh from identity, pose, and translation parameters."""
+) -> np.ndarray:
+    """Get vertices from identity, pose, and translation parameters."""
     smplh = _get_smplh()
 
-    # Prepare inputs for smplx - pose might be in rotation matrix format (3x3) or axis-angle (3,)
+    # Prepare inputs for smplx
     pose_flat = np.asarray(pose).flatten()
 
     betas = (
@@ -472,7 +469,53 @@ def draw_mesh(
         right_hand_pose=right_hand_pose,
         transl=transl,
     )
-    vertices = output.vertices[0].detach().cpu().numpy()
+    return output.vertices[0].detach().cpu().numpy()
+
+
+def project_vertices(
+    vertices: np.ndarray,
+    world_to_cam: np.ndarray,
+    cam_to_img: np.ndarray,
+) -> np.ndarray:
+    """Project 3D vertices to 2D image pixels using Extrinsics and Intrinsics."""
+    # 1. World -> Camera
+    # Vertices: (N, 3) -> (N, 4) Homogeneous
+    ones = np.ones((vertices.shape[0], 1))
+    vertices_homo = np.hstack([vertices, ones])  # (N, 4)
+
+    # world_to_cam is (4, 4)
+    # Cam = Ext * World.T -> (4, 4) * (4, N) -> (4, N)
+    points_cam = np.dot(world_to_cam, vertices_homo.T)  # (4, N)
+
+    # 2. Camera -> Image (Projection)
+    # Only use x,y,z
+    xyz_cam = points_cam[:3, :]  # (3, N)
+
+    # Intrinsics: (3, 3)
+    # Img_Homo = K * Cam
+    points_img_homo = np.dot(cam_to_img, xyz_cam)  # (3, N)
+
+    # 3. Perspective Divide
+    # u = x' / z', v = y' / z'
+    z = points_img_homo[2, :]
+    z[z == 0] = 1e-5  # Avoid division by zero
+    u = points_img_homo[0, :] / z
+    v = points_img_homo[1, :] / z
+
+    return np.stack([u, v], axis=1)  # (N, 2)
+
+
+def draw_mesh(
+    image: np.ndarray,
+    identity: np.ndarray,
+    pose: np.ndarray,
+    translation: np.ndarray,
+    world_to_cam: np.ndarray,
+    cam_to_img: np.ndarray,
+) -> np.ndarray:
+    """Draw a mesh from identity, pose, and translation parameters."""
+    smplh = _get_smplh()  # Ensure model is loaded (though get_vertices does too)
+    vertices = get_smplh_vertices(identity, pose, translation)
 
     render = _render_mesh(
         vertices, smplh.faces, world_to_cam, cam_to_img, image.shape[:2][::-1]
@@ -790,6 +833,39 @@ def visualize_mesh(image: str = "img_0000020_003.jpg") -> None:
     )
     cv2.imshow("Mesh", vis_img)
     cv2.waitKey(0)
+
+
+def draw_dense_landmarks(
+    img: np.ndarray,
+    vertices: np.ndarray,
+    dense_indices: list[int],
+    world_to_cam: np.ndarray,
+    cam_to_img: np.ndarray,
+    color: tuple[int, int, int] = (0, 255, 255),  # Yellow (BGR for cv2)
+    radius: int = 1,
+) -> None:
+    """Draws specific vertices as dense landmarks."""
+    if img.dtype != np.uint8:
+        raise ValueError("Image must be uint8")
+
+    # Select specific vertices
+    selected_verts = vertices[dense_indices]
+
+    # Project to 2D
+    points_2d = project_vertices(selected_verts, world_to_cam, cam_to_img)
+
+    img_size = (img.shape[1], img.shape[0])
+
+    for pt in points_2d:
+        if 0 <= pt[0] < img_size[0] and 0 <= pt[1] < img_size[1]:
+            cv2.circle(
+                img,
+                (int(pt[0]), int(pt[1])),
+                radius,
+                color,
+                -1,
+                cv2.LINE_AA,
+            )
 
 
 def visualize_landmarks(image: str = "img_0000020_003.jpg") -> None:

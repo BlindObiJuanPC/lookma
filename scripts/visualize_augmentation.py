@@ -11,7 +11,13 @@ sys.path.append(os.getcwd())
 
 from lookma.dataset import SynthBodyDataset, SynthHandDataset
 from lookma.helpers.augmentation import TrainingAugmentation
-from lookma.helpers.visualize_data import draw_mesh, draw_skeleton, LDMK_CONN
+from lookma.helpers.visualize_data import (
+    LDMK_CONN,
+    draw_dense_landmarks,
+    draw_mesh,
+    draw_skeleton,
+    get_smplh_vertices,
+)
 
 
 def main():
@@ -34,6 +40,12 @@ def main():
         type=str,
         default="data/synth_hand",
         help="Root dir for hand data",
+    )
+    parser.add_argument(
+        "--save_path",
+        type=str,
+        default=None,
+        help="Path to save the first visualization and exit",
     )
     args = parser.parse_args()
 
@@ -111,6 +123,22 @@ def main():
             # Select proper connectivity
             conn_key = "hand" if args.dataset == "hand" else "body"
             draw_skeleton(align_vis, ldmks, LDMK_CONN[conn_key], thickness=1)
+
+            # Draw dense landmarks for hand
+            if args.dataset == "hand":
+                vertices = get_smplh_vertices(
+                    item["betas"].numpy(),
+                    item["pose"].numpy(),
+                    item["trans"].numpy(),
+                )
+                draw_dense_landmarks(
+                    align_vis,
+                    vertices,
+                    SynthHandDataset.DENSE_LANDMARK_IDS,
+                    item["cam_extrinsics"].numpy(),
+                    item["cam_intrinsics"].numpy(),
+                    color=(0, 255, 255),  # Yellow
+                )
 
         except Exception as e:
             print(f"Mesh draw failed: {e}")
@@ -242,6 +270,11 @@ def main():
                 color,
                 1,
             )
+
+        if args.save_path:
+            cv2.imwrite(args.save_path, combined)
+            print(f"Saved visualization to {args.save_path}")
+            sys.exit(0)
 
         cv2.imshow("Augmentation Visualization", combined)
 
