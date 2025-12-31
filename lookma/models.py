@@ -5,7 +5,7 @@ import timm
 from lookma.dataset import SynthBodyDataset
 
 
-class HMRBodyNetwork(nn.Module):
+class BodyNetwork(nn.Module):
     def __init__(self, backbone_name="hrnet_w48", pretrained=True):
         super().__init__()
 

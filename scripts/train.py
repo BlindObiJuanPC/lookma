@@ -13,7 +13,7 @@ from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
 from lookma.losses import BodyLoss
-from lookma.models import HMRBodyNetwork
+from lookma.models import BodyNetwork
 
 # --- FINAL PRODUCTION CONFIG (RTX 5090) ---
 BATCH_SIZE = 128  # Calculated from a VRAM stress test
@@ -101,7 +101,7 @@ def train():
         drop_last=True,
     )
 
-    model = HMRBodyNetwork(backbone_name="hrnet_w48").to(DEVICE)
+    model = BodyNetwork(backbone_name="hrnet_w48").to(DEVICE)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
     )
