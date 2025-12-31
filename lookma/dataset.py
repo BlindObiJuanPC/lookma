@@ -9,6 +9,9 @@ from torch.utils.data import Dataset
 
 
 class SynthBodyDataset(Dataset):
+    # Every 5th vertex of the 6890 vertices in SMPL
+    DENSE_LANDMARK_IDS = list(range(0, 6890, 5))
+
     def __init__(
         self,
         root_dir,
@@ -240,6 +243,7 @@ class SynthBodyDataset(Dataset):
 
 
 class SynthHandDataset(SynthBodyDataset):
+    # Manually selected hand vertices (based on the image in the paper)
     DENSE_LANDMARK_IDS = [
         1982,
         1984,

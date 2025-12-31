@@ -124,8 +124,8 @@ def main():
             conn_key = "hand" if args.dataset == "hand" else "body"
             draw_skeleton(align_vis, ldmks, LDMK_CONN[conn_key], thickness=1)
 
-            # Draw dense landmarks for hand
-            if args.dataset == "hand":
+            # Draw dense landmarks (if defined in dataset)
+            if hasattr(dataset, "DENSE_LANDMARK_IDS"):
                 vertices = get_smplh_vertices(
                     item["betas"].numpy(),
                     item["pose"].numpy(),
@@ -134,7 +134,7 @@ def main():
                 draw_dense_landmarks(
                     align_vis,
                     vertices,
-                    SynthHandDataset.DENSE_LANDMARK_IDS,
+                    dataset.DENSE_LANDMARK_IDS,
                     item["cam_extrinsics"].numpy(),
                     item["cam_intrinsics"].numpy(),
                     color=(0, 255, 255),  # Yellow
