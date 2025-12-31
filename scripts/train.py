@@ -211,6 +211,12 @@ def train(args):
                 optimizer, T_max=cfg["epochs"] - 1
             )
 
+            # FORCE RE-COMPILE to ensure the graph respects the new requires_grad=True
+            if args.compile and not args.explain:
+                print("Forcing full re-compilation to update gradient graph...")
+                torch._dynamo.reset()
+                model = torch.compile(raw_model)
+
             # Verify Trainable Params
             num_trainable = sum(
                 p.numel() for p in model.parameters() if p.requires_grad
