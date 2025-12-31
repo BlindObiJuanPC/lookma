@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import timm
 
+from lookma.dataset import SynthBodyDataset
+
 
 class HMRBodyNetwork(nn.Module):
     def __init__(self, backbone_name="hrnet_w48", pretrained=True):
@@ -14,7 +16,7 @@ class HMRBodyNetwork(nn.Module):
         feature_dim = self.backbone.num_features
 
         # Define Landmark Count (Every 5th vertex of 6890 SMPL mesh)
-        self.n_dense = 1378
+        self.num_dense_landmarks = len(SynthBodyDataset.DENSE_LANDMARK_IDS)
 
         # Define Heads (Paper Spec: 2 FC layers, Hidden 512, Leaky ReLU)
         def make_head(output_dim):
@@ -31,7 +33,7 @@ class HMRBodyNetwork(nn.Module):
         self.shape_head = make_head(10)
 
         # Predict the location of every 5th vertex in 2D.
-        self.ldmk_head = make_head(self.n_dense * 3)
+        self.ldmk_head = make_head(self.num_dense_landmarks * 3)
 
         # Initialize Weights
 
@@ -58,7 +60,9 @@ class HMRBodyNetwork(nn.Module):
 
         # Landmarks (with 0-1 scaling for X, Y)
         # Reshape flat output to [Batch, N, 3]
-        raw_ldmk = self.ldmk_head(features).view(x.shape[0], self.n_dense, 3)
+        raw_ldmk = self.ldmk_head(features).view(
+            x.shape[0], self.num_dense_landmarks, 3
+        )
 
         # x, y: Use sigmoid so they stay within image bounds [0, 1]
         xy = torch.sigmoid(raw_ldmk[..., :2])
