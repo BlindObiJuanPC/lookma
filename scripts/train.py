@@ -179,7 +179,7 @@ def train(args):
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         total_loss = 0.0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if epoch == 1:  # Warmup heads
             for param in model.backbone.parameters():
@@ -263,7 +263,7 @@ def train(args):
             if (batch_idx + 1) % cfg["acc_steps"] == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * cfg["acc_steps"]
             progress_bar.set_postfix(
