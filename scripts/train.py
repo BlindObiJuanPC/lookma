@@ -158,7 +158,9 @@ def train(args):
     model = cfg["model_cls"](backbone_name=cfg["backbone"]).to(DEVICE)
     model = model.to(memory_format=torch.channels_last)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["epochs"]
     )
@@ -188,7 +190,7 @@ def train(args):
                 param.requires_grad = True
             # Re-init optimizer so it sees the new parameters
             optimizer = torch.optim.AdamW(
-                model.parameters(), lr=cfg["lr"], weight_decay=1e-4
+                model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=cfg["epochs"] - 1
