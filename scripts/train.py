@@ -18,6 +18,12 @@ from lookma.models import BodyNetwork, HandNetwork
 # --- CONFIGURATION (RTX 5090) ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Performance Optimizations
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 CONFIGS = {
     "body": {
         "batch_size": 128,
@@ -126,9 +132,12 @@ def save_debug_image(
 def train(args):
     cfg = CONFIGS[args.type]
 
-    print(
-        f"RUNNING {args.type.upper()} TRAINING | Batch: {cfg['batch_size']} | Eff: {cfg['batch_size'] * cfg['acc_steps']}"
-    )
+    if not args.explain:
+        print(
+            f"RUNNING {args.type.upper()} TRAINING | "
+            f"Batch: {cfg['batch_size']} | "
+            f"Eff: {cfg['batch_size'] * cfg['acc_steps']}"
+        )
 
     # Checkpoint Dir
     ckpt_dir = f"experiments/checkpoints/{args.type}"
@@ -147,12 +156,18 @@ def train(args):
     )
 
     model = cfg["model_cls"](backbone_name=cfg["backbone"]).to(DEVICE)
+    model = model.to(memory_format=torch.channels_last)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["epochs"]
     )
     criterion = cfg["loss_cls"]("data/smplx", device=DEVICE)
     # GradScaler not needed for BF16
+
+    if args.compile and not args.explain:
+        print("Compiling model (mode='max-autotune')... (First step will be slow)")
+        model = torch.compile(model, mode="max-autotune")
 
     gpu_aug = TrainingAugmentation().to(DEVICE)
 
@@ -179,7 +194,7 @@ def train(args):
                 optimizer, T_max=cfg["epochs"] - 1
             )
 
-        progress_bar = tqdm(loader, desc=f"Epoch {epoch}")
+        progress_bar = tqdm(loader, desc=f"Epoch {epoch}", disable=args.explain)
         for batch_idx, batch in enumerate(progress_bar):
             raw_imgs = batch["image"].to(DEVICE, non_blocking=True) / 255.0
             if epoch >= 2:
@@ -187,7 +202,8 @@ def train(args):
 
             norm_imgs = TF.normalize(
                 raw_imgs, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )
+            ).to(memory_format=torch.channels_last)
+
             ext = batch["cam_extrinsics"].to(DEVICE, non_blocking=True)
             gt_world_t = batch["trans"].to(DEVICE, non_blocking=True)
             curr_batch = raw_imgs.shape[0]
@@ -195,6 +211,22 @@ def train(args):
             gt_cam_t = torch.matmul(
                 ext, torch.cat([gt_world_t.unsqueeze(-1), ones], dim=1)
             )[:, :3, 0]
+
+            if args.explain:
+                import torch._dynamo as _dynamo
+
+                print("Analyzing model for graph breaks (torch._dynamo.explain)...")
+                # We explain the 'model' callable with its inputs
+                explanation = _dynamo.explain(model)(norm_imgs)
+                print(f"\n{explanation.compile_times}")
+                print(f"\nGraph Count: {explanation.graph_count}")
+                print(f"Graph Breaks: {explanation.graph_break_count}")
+                if explanation.break_reasons:
+                    print("Break Reasons:")
+                    for reason in explanation.break_reasons:
+                        print(f"  - {reason.reason}")
+                print(f"Op Count: {explanation.op_count}\n")
+                return
 
             with autocast("cuda", dtype=torch.bfloat16):
                 # Forward Pass Switch
@@ -277,13 +309,18 @@ if __name__ == "__main__":
         help="Training type: body or hand",
     )
     parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile model using torch.compile (faster)",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Run torch._dynamo.explain to find graph breaks",
+    )
+    parser.add_argument(
         "--dry_run", action="store_true", help="Run a single batch for debugging"
     )
     args = parser.parse_args()
-
-    # Simple hack for dry run: just interrupt loop?
-    # Or cleaner: if dry_run, break after 1 step.
-    # For now, I'll rely on the user running it and Ctrl+C if needed or maybe I'll add logic later.
-    # Actually, let's keep it simple.
 
     train(args)

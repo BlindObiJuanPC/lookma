@@ -25,12 +25,10 @@ class SynthBodyDataset(Dataset):
         self.is_train = is_train  # Turns augmentation on/off
         self.return_debug_info = return_debug_info
 
-        print(f"Scanning {root_dir} for metadata files...")
+        print("Loading metadata JSON files...")
         if specific_image:
-            target_meta = (
-                specific_image.replace("img_", "metadata_")
-                .replace(".jpg", ".json")
-                .replace(".png", ".json")
+            target_meta = specific_image.replace("img_", "metadata_").replace(
+                ".jpg", ".json"
             )
             self.json_paths = [os.path.join(root_dir, target_meta)]
         else:
