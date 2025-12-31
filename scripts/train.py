@@ -26,8 +26,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 CONFIGS = {
     "body": {
-        "batch_size": 128,
-        "acc_steps": 2,  # Effective 256
+        "batch_size": 256,
+        "acc_steps": 1,
         "lr": 1e-4,
         "epochs": 600,
         "target_size": 256,
@@ -190,6 +190,12 @@ def train(args):
         if epoch == 1:  # Warmup heads
             for param in model.backbone.parameters():
                 param.requires_grad = False
+
+            num_trainable = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            print(f"DEBUG: Epoch 1 (Frozen) Trainable Params: {num_trainable:,}")
+
         if epoch == 2:  # Full train
             print("Unfreezing Backbone...")
             # Handle compiled model wrapper if present
