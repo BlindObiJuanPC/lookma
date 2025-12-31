@@ -153,6 +153,7 @@ def train(args):
         num_workers=cfg["num_workers"],
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
     )
 
     model = cfg["model_cls"](backbone_name=cfg["backbone"]).to(DEVICE)
