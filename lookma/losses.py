@@ -18,7 +18,7 @@ def geodesic_loss(R1, R2):
     return torch.acos(val).mean()
 
 
-class HMRLoss(nn.Module):
+class BodyLoss(nn.Module):
     def __init__(self, smpl_model_path, device="cuda"):
         super().__init__()
         self.smpl = smplx.create(
@@ -159,7 +159,7 @@ class HMRLoss(nn.Module):
         )
 
 
-class HMRHandLoss(nn.Module):
+class HandLoss(nn.Module):
     def __init__(self, smpl_model_path, device="cuda"):
         super().__init__()
         self.smpl = smplx.create(

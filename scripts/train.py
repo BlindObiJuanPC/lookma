@@ -12,7 +12,7 @@ from lookma.dataset import SynthBodyDataset
 from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
-from lookma.losses import HMRLoss
+from lookma.losses import BodyLoss
 from lookma.models import HMRBodyNetwork
 
 # --- FINAL PRODUCTION CONFIG (RTX 5090) ---
@@ -106,7 +106,7 @@ def train():
         model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-    criterion = HMRLoss("data/smplx", device=DEVICE)
+    criterion = BodyLoss("data/smplx", device=DEVICE)
     scaler = GradScaler("cuda")
 
     gpu_aug = TrainingAugmentation().to(DEVICE)
