@@ -224,6 +224,14 @@ def main():
         else:
             gpu_lines.append("Pixelate: OFF")
 
+        # Motion Blur
+        blur = debug_info["motion_blur"]
+        if blur["applied"]:
+            gpu_lines.append(f"Blur: ON (k={blur['kernel_size']})")
+            gpu_lines.append(f" Ang: {blur['angle']:.1f}")
+        else:
+            gpu_lines.append("Blur: OFF")
+
         for i, line in enumerate(gpu_lines):
             cv2.putText(
                 combined,

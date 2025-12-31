@@ -57,6 +57,57 @@ class Pixelate(nn.Module):
         return img
 
 
+class MotionBlur(nn.Module):
+    def forward(self, img, return_debug_info=False):
+        info = {"applied": False, "angle": 0.0, "kernel_size": 0}
+
+        if torch.rand(1) < 0.5:
+            # Uniformly sample kernel sizes [1..10]
+            # Even kernels allowed per user request.
+            k = int(torch.randint(1, 11, (1,)).item())
+
+            angle = torch.rand(1).item() * 180
+
+            # Create a horizontal line kernel
+            kernel = torch.zeros((k, k), device=img.device)
+            center = k // 2
+            kernel[center, :] = 1.0
+
+            # Rotate kernel matrix
+            # Expand to [1, 1, k, k] to use TF.rotate
+            kernel = kernel.unsqueeze(0).unsqueeze(0)
+            kernel = TF.rotate(kernel, angle)
+            kernel = kernel.squeeze()
+
+            # Normalize
+            kernel = kernel / kernel.sum()
+
+            # Apply convolution
+            # img is [B, C, H, W]
+            # Kernel needs to be [C, 1/groups, k, k] -> [3, 1, k, k] for depthwise conv
+            C = img.shape[1]
+            weight = kernel.expand(C, 1, k, k)
+
+            # Pad image to maintain size
+            pad = k // 2
+            blurred = torch.nn.functional.conv2d(img, weight, padding=pad, groups=C)
+
+            # Fix dimensions for even kernels (padding=k//2 results in +1 size)
+            if k % 2 == 0:
+                blurred = blurred[..., : img.shape[2], : img.shape[3]]
+
+            if return_debug_info:
+                info["applied"] = True
+                info["angle"] = angle
+                info["kernel_size"] = k
+                return blurred, info
+            return blurred
+
+        if return_debug_info:
+            return img, info
+        return img
+
+
 class TrainingAugmentation(nn.Module):
     def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05):
         super().__init__()
@@ -71,11 +122,13 @@ class TrainingAugmentation(nn.Module):
         )
         self.iso_noise = AddISONoise()
         self.pixelate = Pixelate()
+        self.motion_blur = MotionBlur()
 
     def forward(self, img, return_debug_info=False):
         if not return_debug_info:
             # Fast path
             img = self.color_aug(img)
+            img = self.motion_blur(img, return_debug_info=False)
             img = self.iso_noise(img, return_debug_info=False)
             img = self.pixelate(img, return_debug_info=False)
             return img
@@ -112,6 +165,9 @@ class TrainingAugmentation(nn.Module):
                 img_aug = TF.adjust_hue(img_aug, h)
                 jitter_info["hue"] = h
 
+        # Apply Motion Blur (First, before Noise/Pixelate)
+        img_aug, blur_info = self.motion_blur(img_aug, return_debug_info=True)
+
         # Apply ISO Noise
         img_aug, iso_info = self.iso_noise(img_aug, return_debug_info=True)
 
@@ -122,4 +178,5 @@ class TrainingAugmentation(nn.Module):
             "color_jitter": jitter_info,
             "iso_noise": iso_info,
             "pixelate": pix_info,
+            "motion_blur": blur_info,
         }
