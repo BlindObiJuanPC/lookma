@@ -52,7 +52,7 @@ class HMRLoss(nn.Module):
         batch_size = pred_pose_6d.shape[0]
         device = pred_pose_6d.device
 
-        # 1. PREPARE PARAMETERS
+        # PREPARE PARAMETERS
         # Converting 21 body joints to Rotation Matrices
         pred_body_rotmat = rotation_6d_to_matrix(pred_pose_6d.view(batch_size, 21, 6))
         gt_rotmat = batch_rodrigues(gt_pose_aa.view(batch_size, 52, 3))
@@ -62,7 +62,7 @@ class HMRLoss(nn.Module):
         full_pred_rotmat = gt_rotmat.clone()
         full_pred_rotmat[:, 1:22] = pred_body_rotmat
 
-        # 2. RUN KINEMATICS (Local Space)
+        # RUN KINEMATICS (Local Space)
         pred_output = self.smpl(
             betas=pred_shape[:, :10],
             global_orient=full_pred_rotmat[:, 0:1],
@@ -82,17 +82,17 @@ class HMRLoss(nn.Module):
                 pose2rot=False,
             )
 
-        # 4. LOSSES
+        # LOSSES
         # Pose/Rot (Local): Indices 1-21 (Body)
         loss_pose = self.l1(pred_body_rotmat, gt_rotmat[:, 1:22])
 
         # Pose/Rot (Global/World): Indices 1-21 (Body)
-        # 1. Compute Global Rotations via FK
+        # Compute Global Rotations via FK
         pred_global_rotmat = batch_get_global_rotation(
             full_pred_rotmat, self.smpl.parents
         )
         gt_global_rotmat = batch_get_global_rotation(gt_rotmat, self.smpl.parents)
-        # 2. Compare Global Rotations (Geodesic)
+        # Compare Global Rotations (Geodesic)
         loss_joint_r = geodesic_loss(
             pred_global_rotmat[:, 1:22], gt_global_rotmat[:, 1:22]
         )
@@ -133,13 +133,13 @@ class HMRLoss(nn.Module):
 
         # Re-Project for debug visualization
         # Use GT Camera parameters since we don't predict them anymore
-        # 1. Rotate to Cam Frame
+        # Rotate to Cam Frame
         pred_joints_rotated = torch.matmul(
             R_ext, pred_output.joints.transpose(1, 2)
         ).transpose(1, 2)
-        # 2. Add GT Translation
+        # Add GT Translation
         pred_joints_cam = pred_joints_rotated + gt_translation_cam.unsqueeze(1)
-        # 3. Project
+        # Project
         pred_joints_2d = perspective_projection(
             pred_joints_cam, torch.zeros(batch_size, 3, device=device), cam_intrinsics
         )
