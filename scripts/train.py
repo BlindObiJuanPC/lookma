@@ -146,14 +146,19 @@ def train(args):
     dataset = cfg["dataset_cls"](
         cfg["data_path"], target_size=cfg["target_size"], is_train=True
     )
+
+    # Optimize loader for explain/debug mode
+    num_workers = 0 if args.explain else cfg["num_workers"]
+    persistent = False if args.explain else True
+
     loader = DataLoader(
         dataset,
         batch_size=cfg["batch_size"],
         shuffle=True,
-        num_workers=cfg["num_workers"],
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
+        persistent_workers=persistent,
     )
 
     model = cfg["model_cls"](backbone_name=cfg["backbone"]).to(DEVICE)
@@ -196,6 +201,9 @@ def train(args):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=cfg["epochs"] - 1
             )
+
+        if epoch == 1 and num_workers > 0:
+            print("Initializing Dataloader workers (this may take a few seconds)...")
 
         progress_bar = tqdm(loader, desc=f"Epoch {epoch}", disable=args.explain)
         for batch_idx, batch in enumerate(progress_bar):
