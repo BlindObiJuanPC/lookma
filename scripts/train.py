@@ -174,8 +174,8 @@ def train(args):
     # GradScaler not needed for BF16
 
     if args.compile and not args.explain:
-        print("Compiling model (mode='max-autotune')... (First step will be slow)")
-        model = torch.compile(model, mode="max-autotune")
+        print("Compiling model (default mode)...")
+        model = torch.compile(model)
 
     gpu_aug = TrainingAugmentation().to(DEVICE)
 
