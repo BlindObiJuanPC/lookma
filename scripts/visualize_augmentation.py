@@ -9,7 +9,7 @@ import torch
 # Add project root to sys.path
 sys.path.append(os.getcwd())
 
-from lookma.dataset import SynthBodyDataset, SynthHandDataset
+from lookma.dataset import SynthBodyDataset, SynthHandDataset, SynthBodyRoiDataset
 from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.visualize_data import (
     LDMK_CONN,
@@ -25,7 +25,7 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["body", "hand"],
+        choices=["body", "hand", "roi"],
         default="body",
         help="Which dataset to visualize",
     )
@@ -54,10 +54,15 @@ def main():
         dataset = SynthBodyDataset(
             root_dir=args.root_body, is_train=True, return_debug_info=True
         )
-    else:
+    elif args.dataset == "hand":
         print(f"Initializing SynthHandDataset from {args.root_hand}...")
         dataset = SynthHandDataset(
             root_dir=args.root_hand, is_train=True, return_debug_info=True
+        )
+    elif args.dataset == "roi":
+        print(f"Initializing SynthBodyRoiDataset from {args.root_body}...")
+        dataset = SynthBodyRoiDataset(
+            root_dir=args.root_body, is_train=True, return_debug_info=True
         )
 
     print(f"Dataset length: {len(dataset)}")
@@ -102,52 +107,78 @@ def main():
         aug_img_bgr = cv2.cvtColor(aug_img_np, cv2.COLOR_RGB2BGR)
 
         # Original Clean (Before Dataset Crop/Aug)
-        orig_clean = item["original_image"]
-        orig_clean_bgr = cv2.cvtColor(orig_clean, cv2.COLOR_RGB2BGR)
+        orig_clean = item.get("original_image")
+        if orig_clean is not None:
+            orig_clean_bgr = cv2.cvtColor(orig_clean, cv2.COLOR_RGB2BGR)
+        else:
+            orig_clean_bgr = np.zeros_like(raw_img_bgr)  # Fallback
 
         # Alignment Visualization: Mesh Mask
-        align_img = raw_img_bgr.copy()
+        align_img = aug_img_bgr.copy()
         try:
-            align_vis = draw_mesh(
-                align_img,
-                item["betas"].numpy(),
-                item["pose"].numpy(),
-                item["trans"].numpy(),
-                item["cam_extrinsics"].numpy(),
-                item["cam_intrinsics"].numpy(),
-            )
-            # Also draw skeleton on top
-            # landmarks_2d is tensor -> numpy
+            # Check if we have necessary 3D params (ROI dataset might simulate them or not)
+            if "cam_intrinsics" in item and "cam_extrinsics" in item:
+                # Note: Draw mesh requires 3D params. ROI dataset updates intrinsics/extrinsics.
+                align_vis = draw_mesh(
+                    align_img,
+                    item["betas"].numpy(),
+                    item["pose"].numpy(),
+                    item.get(
+                        "trans", torch.zeros(3)
+                    ).numpy(),  # ROI might skip trans return or it is zero centered
+                    item["cam_extrinsics"].numpy(),
+                    item["cam_intrinsics"].numpy(),
+                )
+            else:
+                align_vis = align_img
+
+            # Draw skeleton on top
             ldmks = item["landmarks_2d"].numpy()
 
             # Select proper connectivity
             conn_key = "hand" if args.dataset == "hand" else "body"
-            draw_skeleton(align_vis, ldmks, LDMK_CONN[conn_key], thickness=1)
+            # If shape doesn't match skeleton, skip or warn
+            if ldmks.shape[0] > 100:  # Dense landmarks probably
+                pass  # Use draw_dense
+            elif ldmks.shape[0] == 21:  # Body Joints? No 2D ldmks usually 2D.
+                # Hand is 21 joints, Body is...
+                # ROI output is 36 points. Skeleton conn might not match.
+                if args.dataset != "roi":
+                    draw_skeleton(align_vis, ldmks, LDMK_CONN[conn_key], thickness=1)
 
             # Draw dense landmarks (if defined in dataset)
             if hasattr(dataset, "DENSE_LANDMARK_IDS"):
-                vertices = get_smplh_vertices(
-                    item["betas"].numpy(),
-                    item["pose"].numpy(),
-                    item["trans"].numpy(),
-                )
-                draw_dense_landmarks(
-                    align_vis,
-                    vertices,
-                    dataset.DENSE_LANDMARK_IDS,
-                    item["cam_extrinsics"].numpy(),
-                    item["cam_intrinsics"].numpy(),
-                    color=(0, 255, 255),  # Yellow
-                )
+                # For ROI dataset, landmarks_2d ARE the dense landmarks
+                if args.dataset == "roi":
+                    # Draw these points
+                    for i in range(ldmks.shape[0]):
+                        # ldmks are normalized 0-1
+                        x = int(ldmks[i, 0] * align_vis.shape[1])
+                        y = int(ldmks[i, 1] * align_vis.shape[0])
+                        cv2.circle(align_vis, (x, y), 2, (0, 255, 255), -1)
+                else:
+                    # For Body/Hand, we project specific vertices
+                    vertices = get_smplh_vertices(
+                        item["betas"].numpy(),
+                        item["pose"].numpy(),
+                        item["trans"].numpy(),
+                    )
+                    draw_dense_landmarks(
+                        align_vis,
+                        vertices,
+                        dataset.DENSE_LANDMARK_IDS,
+                        item["cam_extrinsics"].numpy(),
+                        item["cam_intrinsics"].numpy(),
+                        color=(0, 255, 255),  # Yellow
+                    )
 
         except Exception as e:
             print(f"Mesh draw failed: {e}")
             align_vis = np.zeros_like(align_img)
 
-        # Visualization Layout
+        # Visualization Layout: 2x2 Grid
         h_disp = 512
 
-        # Scale all to h_disp
         def resize_h(img, target_h):
             h, w = img.shape[:2]
             scale = target_h / h
@@ -155,76 +186,82 @@ def main():
 
         disp_clean = resize_h(orig_clean_bgr, h_disp)
         disp_raw = resize_h(raw_img_bgr, h_disp)
-        disp_align = resize_h(align_vis, h_disp)
         disp_aug = resize_h(aug_img_bgr, h_disp)
+        disp_align = resize_h(align_vis, h_disp)
 
-        # Concatenate: [Original Full] | [Dataset Crop] | [GPU Aug] | [Align Check]
-        combined = np.hstack([disp_clean, disp_raw, disp_aug, disp_align])
+        # Grid:
+        # [Clean] [Raw/Crop]
+        # [Aug]   [Align]
+
+        # Ensure widths match for vertical stacking
+        # Top Row
+        w_top = disp_clean.shape[1] + disp_raw.shape[1]
+        top_row = np.hstack([disp_clean, disp_raw])
+
+        # Bottom Row
+        w_bot = disp_aug.shape[1] + disp_align.shape[1]
+        bot_row = np.hstack([disp_aug, disp_align])
+
+        # Pad if widths mismatch
+        max_w = max(w_top, w_bot)
+        if w_top < max_w:
+            pad = np.zeros((h_disp, max_w - w_top, 3), dtype=np.uint8)
+            top_row = np.hstack([top_row, pad])
+        if w_bot < max_w:
+            pad = np.zeros((h_disp, max_w - w_bot, 3), dtype=np.uint8)
+            bot_row = np.hstack([bot_row, pad])
+
+        combined = np.vstack([top_row, bot_row])
 
         # Draw Text
         font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 0.5
-        line_spacing = 20
-        color = (0, 0, 255)  # Red
+        font_scale = 0.6
+        color = (0, 255, 0)
+        thick = 1
 
-        # Determine x start positions
-        x_clean = 10
-        x_raw = disp_clean.shape[1] + 10
-        x_aug = disp_clean.shape[1] + disp_raw.shape[1] + 10
-        x_align = disp_clean.shape[1] + disp_raw.shape[1] + disp_aug.shape[1] + 10
+        # Top Left
+        cv2.putText(combined, "Original Full", (10, 30), font, font_scale, color, thick)
 
-        y_start = 30
+        # Top Right
+        x_tr = disp_clean.shape[1] + 10
+        cv2.putText(
+            combined, "Dataset Crop", (x_tr, 30), font, font_scale, color, thick
+        )
 
-        # Labels
+        # Bottom Left
+        y_bot = h_disp + 30
         cv2.putText(
-            combined, "Raw Source", (x_clean, h_disp - 10), font, 0.6, (0, 255, 0), 1
+            combined, "GPU Augmented", (10, y_bot), font, font_scale, color, thick
         )
-        cv2.putText(
-            combined, "Dataset Crop", (x_raw, h_disp - 10), font, 0.6, (0, 255, 0), 1
-        )
-        cv2.putText(
-            combined,
-            "Mesh Alignment",
-            (x_align, h_disp - 10),
-            font,
-            0.6,
-            (0, 255, 0),
-            1,
-        )
+
+        # Bottom Right
+        x_br = disp_aug.shape[1] + 10
         cv2.putText(
             combined,
-            "GPU Augmentation",
-            (x_aug, h_disp - 10),
+            "Ground Truth / Landmarks",
+            (x_br, y_bot),
             font,
-            0.6,
-            (0, 255, 0),
-            1,
+            font_scale,
+            color,
+            thick,
         )
 
-        # Print Aug params
-        # Dataset Aug Params
-        ds_aug = item["aug_params"]
-        ds_lines = [
-            f"Rot: {ds_aug['rot']:.1f}",
-            f"Scale: {ds_aug['scale']:.2f}",
-            f"Shift X: {ds_aug['shift_x']:.2f}",
-            f"Shift Y: {ds_aug['shift_y']:.2f}",
-        ]
+        # Print Aug params overlays
+        # Dataset Params (Top Right)
+        ds_aug = item.get("aug_params", {})
+        y_txt = 60
+        for k, v in ds_aug.items():
+            if isinstance(v, (float, int)) and not isinstance(v, bool):
+                txt = f"{k}: {v:.2f}"
+            else:
+                txt = f"{k}: {v}"
+            cv2.putText(combined, txt, (x_tr, y_txt), font, 0.5, (0, 0, 255), 1)
+            y_txt += 20
 
-        for i, line in enumerate(ds_lines):
-            cv2.putText(
-                combined,
-                line,
-                (x_raw, y_start + i * line_spacing),
-                font,
-                font_scale,
-                color,
-                1,
-            )
-
-        # GPU Aug Params
+        # GPU Params (Bottom Left)
+        # Reuse existing logic to format lines
         gpu_lines = []
-
+        # ... (rest of gpu lines logic from original file, re-implemented here concisely) ...
         # Color Jitter
         cj = debug_info["color_jitter"]
         if cj["brightness"]:
@@ -236,40 +273,25 @@ def main():
         if cj["hue"]:
             gpu_lines.append(f"Hue: {cj['hue']:.2f}")
 
-        # ISO Noise
+        # ISO
         iso = debug_info["iso_noise"]
         if iso["applied"]:
-            gpu_lines.append("ISO Noise: ON")
-            gpu_lines.append(f" Sigma: {iso['sigma_read']:.4f}")
-            gpu_lines.append(f" Gain: {iso['gain']:.4f}")
-        else:
-            gpu_lines.append("ISO Noise: OFF")
+            gpu_lines.append(f"ISO: {iso['sigma_read']:.3f}/{iso['gain']:.3f}")
 
         # Pixelate
         pix = debug_info["pixelate"]
         if pix["applied"]:
-            gpu_lines.append(f"Pixelate: ON (1/{pix['downsample_factor']})")
-        else:
-            gpu_lines.append("Pixelate: OFF")
+            gpu_lines.append(f"Pix: 1/{pix['downsample_factor']}")
 
-        # Motion Blur
+        # Blur
         blur = debug_info["motion_blur"]
         if blur["applied"]:
-            gpu_lines.append(f"Blur: ON (k={blur['kernel_size']})")
-            gpu_lines.append(f" Ang: {blur['angle']:.1f}")
-        else:
-            gpu_lines.append("Blur: OFF")
+            gpu_lines.append(f"Blur: {blur['angle']:.1f} (k={blur['kernel_size']})")
 
-        for i, line in enumerate(gpu_lines):
-            cv2.putText(
-                combined,
-                line,
-                (x_aug, y_start + i * line_spacing),
-                font,
-                font_scale,
-                color,
-                1,
-            )
+        y_txt = h_disp + 60
+        for line in gpu_lines:
+            cv2.putText(combined, line, (10, y_txt), font, 0.5, (0, 0, 255), 1)
+            y_txt += 20
 
         if args.save_path:
             cv2.imwrite(args.save_path, combined)

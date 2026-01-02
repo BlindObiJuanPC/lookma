@@ -5,52 +5,15 @@ import os
 import cv2
 import numpy as np
 import torch
+
+import smplx
 from torch.utils.data import Dataset
+from lookma.helpers.geometry import perspective_projection
 
 
 class SynthBodyDataset(Dataset):
     # Every 5th vertex of the 6890 vertices in SMPL
     DENSE_LANDMARK_IDS = list(range(0, 6890, 5))
-
-    # Manually selected landmarks used for finding a crop box around the body.
-    ROI_LANDMARK_IDS = [
-        476,
-        1488,
-        3439,
-        3676,
-        4098,
-        4290,
-        4291,
-        4858,
-        4933,
-        5059,
-        5287,
-        5361,
-        5530,
-        5627,
-        5645,
-        5775,
-        5934,
-        6200,
-        6437,
-        6842,
-        7032,
-        7594,
-        7669,
-        7795,
-        8023,
-        8095,
-        8247,
-        8321,
-        8339,
-        8469,
-        8635,
-        8751,
-        8847,
-        8966,
-        9003,
-        9008,
-    ]
 
     def __init__(
         self,
@@ -461,3 +424,242 @@ class SynthHandDataset(SynthBodyDataset):
             shift_y = (np.random.rand() - 0.5) * 2 * shift_factor
 
         return rot, scale, shift_x, shift_y
+
+
+class SynthBodyRoiDataset(SynthBodyDataset):
+    DENSE_LANDMARK_IDS = [
+        331,
+        384,
+        411,
+        480,
+        598,
+        809,
+        1047,
+        1464,
+        1658,
+        1829,
+        1835,
+        2244,
+        2319,
+        2445,
+        2673,
+        2746,
+        3120,
+        3161,
+        3222,
+        3386,
+        3503,
+        3971,
+        4159,
+        4310,
+        4533,
+        4937,
+        5128,
+        5296,
+        5702,
+        5782,
+        5905,
+        6133,
+        6207,
+        6470,
+        6620,
+        6787,
+    ]
+
+    def __init__(
+        self,
+        root_dir,
+        specific_image=None,
+        target_size=256,
+        is_train=True,
+        return_debug_info=False,
+    ):
+        super().__init__(
+            root_dir, specific_image, target_size, is_train, return_debug_info
+        )
+        # Load SMPL Model on CPU for data processing
+        self.smpl = smplx.create(
+            "data/smplx",
+            model_type="smplh",
+            gender="neutral",
+            use_pca=False,
+            num_betas=10,
+        )
+        self.smpl.pose_mean = torch.tensor([0.0])
+
+    def __getitem__(self, idx):
+        try:
+            json_path = self.json_paths[idx]
+            with open(json_path, "r") as f:
+                meta = json.load(f)
+
+            base_name = (
+                os.path.basename(json_path)
+                .replace("metadata_", "img_")
+                .replace(".json", ".jpg")
+            )
+            img_path = os.path.join(self.root_dir, base_name)
+
+            image = cv2.imread(img_path)
+            if image is None:
+                raise FileNotFoundError
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+
+            # Raw Labels
+            cam_intrinsics = torch.tensor(
+                meta["camera"]["camera_to_image"], dtype=torch.float32
+            )
+            cam_extrinsics = torch.tensor(
+                meta["camera"]["world_to_camera"], dtype=torch.float32
+            )
+            pose = torch.tensor(meta["pose"], dtype=torch.float32).flatten()
+            betas = torch.tensor(meta["body_identity"], dtype=torch.float32)
+            # trans = torch.tensor(meta["translation"], dtype=torch.float32)
+
+            # --- STEP 1: GET 3D VERTICES ---
+            # Reconstruct Full Pose: GT Root (0) + Pred Body (1-21) + GT Hands (22-51)
+            # pose is axis-angle [52*3]
+            gt_rotmat = smplx.lbs.batch_rodrigues(pose.view(-1, 3))
+
+            # Run SMPL (CPU)
+            with torch.no_grad():
+                output = self.smpl(
+                    betas=betas[:10].unsqueeze(0),
+                    global_orient=gt_rotmat[0:1].unsqueeze(0),
+                    body_pose=gt_rotmat[1:22].unsqueeze(0),
+                    left_hand_pose=gt_rotmat[22:37].unsqueeze(0),
+                    right_hand_pose=gt_rotmat[37:52].unsqueeze(0),
+                    pose2rot=False,
+                )
+                vertices = output.vertices[0]  # [6890, 3]
+
+            # --- STEP 2: PROJECT ALL VERTICES ---
+            # World Translation
+            gt_translation_world = torch.tensor(
+                meta["translation"], dtype=torch.float32
+            ).unsqueeze(0)
+
+            # Vertices in World Space
+            verts_world = vertices + gt_translation_world
+
+            # Vertices in Camera Space
+            # P_cam = R * P_world + T
+            R_ext = cam_extrinsics[:3, :3]
+            T_ext = cam_extrinsics[:3, 3].unsqueeze(0)
+
+            # Apply Extrinsics
+            verts_cam = torch.matmul(R_ext, verts_world.T).T + T_ext
+
+            # Project
+            verts_2d = perspective_projection(
+                verts_cam.unsqueeze(0),
+                torch.zeros(1, 3),  # Translation already applied
+                cam_intrinsics.unsqueeze(0),
+            )[0]  # [6890, 2]
+
+            # --- STEP 3: ROTATE POINTS (AUGMENTATION) ---
+            rot = 0
+            if self.is_train:
+                if np.random.rand() < 0.6:
+                    rot = np.clip(np.random.randn() * 30, -60, 60)
+
+            # Rotate points around Image Center for bbox calculation
+            cx, cy = w / 2, h / 2
+
+            M_rot = cv2.getRotationMatrix2D((cx, cy), rot, 1.0)  # [2x3]
+
+            # Transform All Vertices
+            ones = torch.ones((vertices.shape[0], 1))
+            verts_homo = torch.cat([verts_2d, ones], dim=1)  # [N, 3]
+
+            M_rot_torch = torch.from_numpy(M_rot).float()  # [2, 3]
+            verts_rotated_2d = torch.matmul(M_rot_torch, verts_homo.T).T  # [N, 2]
+
+            # --- STEP 4: CALCULATE BOUNDING BOX ---
+            min_xy = torch.min(verts_rotated_2d, dim=0)[0]
+            max_xy = torch.max(verts_rotated_2d, dim=0)[0]
+
+            bbox_x1, bbox_y1 = min_xy[0].item(), min_xy[1].item()
+            bbox_x2, bbox_y2 = max_xy[0].item(), max_xy[1].item()
+
+            # Padding
+            pad = 20
+            bbox_x1 -= pad
+            bbox_y1 -= pad
+            bbox_x2 += pad
+            bbox_y2 += pad
+
+            # Square Crop
+            bb_w = bbox_x2 - bbox_x1
+            bb_h = bbox_y2 - bbox_y1
+
+            max_dim = max(bb_w, bb_h)
+
+            center_x = (bbox_x1 + bbox_x2) / 2
+            center_y = (bbox_y1 + bbox_y2) / 2
+
+            # --- STEP 5: FINAL WARP ---
+            dst_size = self.target_size  # 256
+
+            # M_rot is 2x3. We need 3x3 for multiplication.
+            M_rot_3x3 = np.eye(3)
+            M_rot_3x3[:2] = M_rot
+
+            # M_crop construction:
+            scale_factor = dst_size / max_dim
+            tx = (dst_size / 2) - center_x * scale_factor
+            ty = (dst_size / 2) - center_y * scale_factor
+
+            M_crop = np.array([[scale_factor, 0, tx], [0, scale_factor, ty], [0, 0, 1]])
+
+            # Combined
+            M_final = np.matmul(M_crop, M_rot_3x3)[:2]  # [2, 3]
+
+            # Warp Image
+            crop_image = cv2.warpAffine(
+                image,
+                M_final,
+                (dst_size, dst_size),
+                flags=cv2.INTER_LINEAR,
+                borderValue=(0, 0, 0),
+            )
+
+            # Warp ROI Landmarks
+            roi_indices = self.DENSE_LANDMARK_IDS
+            roi_verts_2d = verts_2d[roi_indices]  # [36, 2]
+
+            ones_roi = torch.ones((roi_verts_2d.shape[0], 1))
+            roi_homo = torch.cat([roi_verts_2d, ones_roi], dim=1)
+
+            M_final_torch = torch.from_numpy(M_final).float()
+            roi_2d_new = torch.matmul(M_final_torch, roi_homo.T).T  # [36, 2]
+
+            # Normalize to 0-1 for network target
+            roi_2d_norm = roi_2d_new / dst_size
+
+            if self.return_debug_info:
+                return {
+                    "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
+                    "landmarks_2d": roi_2d_norm,
+                    "original_image": image,
+                    "debug_bbox": [bbox_x1, bbox_y1, bbox_x2, bbox_y2],
+                    "debug_verts_rot": verts_rotated_2d,
+                    "aug_params": {
+                        "rot": rot,
+                        "scale": "-",
+                        "shift_x": "-",
+                        "shift_y": "-",
+                    },
+                }
+
+            return {
+                "image": torch.from_numpy(crop_image).permute(2, 0, 1).float(),
+                "landmarks_2d": roi_2d_norm,  # [36, 2]
+            }
+
+        except Exception as e:
+            # Fallback for corrupt files
+            print(f"Error loading {self.json_paths[idx]}: {e}")
+            return self.__getitem__((idx + 1) % len(self))
+            # raise e
