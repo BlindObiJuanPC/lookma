@@ -12,6 +12,40 @@ class SynthBodyDataset(Dataset):
     # Every 5th vertex of the 6890 vertices in SMPL
     DENSE_LANDMARK_IDS = list(range(0, 6890, 5))
 
+    # Manually selected landmarks used for finding a crop box around the body.
+    ROI_LANDMARK_IDS = [
+        3439,
+        3676,
+        4290,
+        4858,
+        4948,
+        5059,
+        5170,
+        5287,
+        5361,
+        5397,
+        5500,
+        5615,
+        5627,
+        5645,
+        5934,
+        6200,
+        6437,
+        7032,
+        7594,
+        7684,
+        7795,
+        7906,
+        8023,
+        8095,
+        8131,
+        8321,
+        8339,
+        8966,
+        9003,
+        9008,
+    ]
+
     def __init__(
         self,
         root_dir,
