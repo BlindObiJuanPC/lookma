@@ -142,7 +142,7 @@ class HandNetwork(nn.Module):
         return pred_pose, pred_ldmk
 
 
-class ROINetwork(nn.Module):
+class BodyRoiNetwork(nn.Module):
     def __init__(self, backbone_name="resnet18", pretrained=True):
         super().__init__()
 
