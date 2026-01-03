@@ -245,6 +245,11 @@ def train(args):
     # Initialize scheduler with correct start epoch
     # last_epoch=start_epoch-2 because PyTorch is 0-indexed and increments on step()
     # If start_epoch=1, last_epoch=-1 (default)
+
+    # Fix: Set initial_lr so scheduler knows what to decay from
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", group["lr"])
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args_epochs, last_epoch=start_epoch - 2
     )
