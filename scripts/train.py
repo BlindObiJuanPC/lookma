@@ -8,12 +8,12 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from lookma.dataset import SynthBodyDataset, SynthHandDataset
+from lookma.dataset import SynthBodyDataset, SynthHandDataset, SynthBodyRoiDataset
 from lookma.helpers.augmentation import TrainingAugmentation
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
-from lookma.losses import BodyLoss, HandLoss
-from lookma.models import BodyNetwork, HandNetwork
+from lookma.losses import BodyLoss, HandLoss, BodyRoiLoss
+from lookma.models import BodyNetwork, HandNetwork, BodyRoiNetwork
 
 # --- CONFIGURATION (RTX 5090) ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,6 +38,7 @@ CONFIGS = {
         "loss_cls": BodyLoss,
         "num_workers": 12,
         "has_shape": True,
+        "is_roi": False,
     },
     "hand": {
         "batch_size": 256,  # Smaller image size (128) allows larger batch
@@ -52,8 +53,52 @@ CONFIGS = {
         "loss_cls": HandLoss,
         "num_workers": 12,
         "has_shape": False,
+        "is_roi": False,
+    },
+    "roi": {
+        "batch_size": 256,
+        "acc_steps": 1,
+        "lr": 1e-4,
+        "epochs": 200,
+        "target_size": 256,
+        "dataset_cls": SynthBodyRoiDataset,
+        "data_path": "data/synth_body",
+        "model_cls": BodyRoiNetwork,
+        "backbone": "resnet18",
+        "loss_cls": BodyRoiLoss,
+        "num_workers": 12,
+        "has_shape": False,
+        "is_roi": True,
     },
 }
+
+
+def save_roi_debug_image(image_tensor, pred_ldmk, gt_ldmk, epoch, batch_idx):
+    with torch.no_grad():
+        img_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # Draw Prediction with Confidence Coloring
+        # Green (Confident) -> Red (Unconfident)
+        # Assumed log_var range: -10 (very confident) to -2 (very uncertain)
+        min_lv, max_lv = -10.0, -2.0
+
+        for i in range(pred_ldmk.shape[1]):
+            x = int(pred_ldmk[0, i, 0] * img_bgr.shape[1])
+            y = int(pred_ldmk[0, i, 1] * img_bgr.shape[0])
+            log_var = float(pred_ldmk[0, i, 2])
+
+            # Map log_var to 0..1
+            t = (log_var - min_lv) / (max_lv - min_lv)
+            t = max(0.0, min(1.0, t))
+
+            # Interpolate Blue=0, Green=(1-t), Red=t
+            color = (0, int(255 * (1 - t)), int(255 * t))
+
+            cv2.circle(img_bgr, (x, y), 2, color, -1)
+
+        os.makedirs("experiments/vis/train_roi", exist_ok=True)
+        cv2.imwrite(f"experiments/vis/train_roi/e{epoch}_b{batch_idx}.jpg", img_bgr)
 
 
 def save_debug_image(
@@ -170,7 +215,10 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["epochs"]
     )
-    criterion = cfg["loss_cls"]("data/smplx", device=DEVICE)
+    if cfg.get("is_roi"):
+        criterion = cfg["loss_cls"]()
+    else:
+        criterion = cfg["loss_cls"]("data/smplx", device=DEVICE)
     # GradScaler not needed for BF16
 
     if args.compile and not args.explain:
@@ -236,13 +284,14 @@ def train(args):
                 raw_imgs, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             ).to(memory_format=torch.channels_last)
 
-            ext = batch["cam_extrinsics"].to(DEVICE, non_blocking=True)
-            gt_world_t = batch["trans"].to(DEVICE, non_blocking=True)
-            curr_batch = raw_imgs.shape[0]
-            ones = torch.ones(curr_batch, 1, 1, device=DEVICE)
-            gt_cam_t = torch.matmul(
-                ext, torch.cat([gt_world_t.unsqueeze(-1), ones], dim=1)
-            )[:, :3, 0]
+            if not cfg.get("is_roi"):
+                ext = batch["cam_extrinsics"].to(DEVICE, non_blocking=True)
+                gt_world_t = batch["trans"].to(DEVICE, non_blocking=True)
+                curr_batch = raw_imgs.shape[0]
+                ones = torch.ones(curr_batch, 1, 1, device=DEVICE)
+                gt_cam_t = torch.matmul(
+                    ext, torch.cat([gt_world_t.unsqueeze(-1), ones], dim=1)
+                )[:, :3, 0]
 
             if args.explain:
                 import torch._dynamo as _dynamo
@@ -262,7 +311,12 @@ def train(args):
 
             with autocast("cuda", dtype=torch.bfloat16):
                 # Forward Pass Switch
-                if cfg["has_shape"]:
+                if cfg.get("is_roi"):
+                    p_ldmk = model(norm_imgs)
+                    gt_ldmk = batch["landmarks_2d"].to(DEVICE)
+                    loss = criterion(p_ldmk, gt_ldmk)
+                    comps = {"loss_dense": loss.item(), "loss_joint_t": 0.0}
+                elif cfg["has_shape"]:
                     p_pose, p_shape, p_ldmk = model(norm_imgs)
                     loss, comps, _ = criterion(
                         p_pose,
@@ -305,15 +359,24 @@ def train(args):
             )
 
             if batch_idx % vis_interval == 0:
-                save_debug_image(
-                    raw_imgs,
-                    p_pose,
-                    p_shape,
-                    batch,
-                    epoch,
-                    batch_idx,
-                    is_hand=(not cfg["has_shape"]),
-                )
+                if cfg.get("is_roi"):
+                    save_roi_debug_image(
+                        raw_imgs,
+                        p_ldmk,
+                        batch["landmarks_2d"].to(DEVICE),
+                        epoch,
+                        batch_idx,
+                    )
+                else:
+                    save_debug_image(
+                        raw_imgs,
+                        p_pose,
+                        p_shape,
+                        batch,
+                        epoch,
+                        batch_idx,
+                        is_hand=(not cfg["has_shape"]),
+                    )
 
             if args.dry_run:
                 print("Dry run complete (1 batch)")
@@ -337,7 +400,7 @@ if __name__ == "__main__":
         "--type",
         type=str,
         default="body",
-        choices=["body", "hand"],
+        choices=["body", "hand", "roi"],
         help="Training type: body or hand",
     )
     parser.add_argument(
