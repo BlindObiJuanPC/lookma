@@ -1,3 +1,4 @@
+import argparse
 import glob
 import json
 import os
@@ -8,10 +9,10 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 
-from lookma.dataset import SynthBodyDataset
+from lookma.dataset import SynthBodyDataset, SynthHandDataset
 from lookma.helpers.geometry import batch_rodrigues, rotation_6d_to_matrix
 from lookma.helpers.visualize_data import draw_mesh
-from lookma.models import HMRBodyNetwork
+from lookma.models import BodyNetwork, HandNetwork
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -52,31 +53,62 @@ def get_affine_transform(meta, target_size=256):
     return M
 
 
-def run_inference(image_name=None):
+def run_inference(args):
+    model_type = args.type
+    image_name = args.image
+
+    DEFAULT_IMAGES = {"body": "img_0000000_001.jpg", "hand": "img_0000008_000.jpg"}
+    image_name = DEFAULT_IMAGES[model_type] if image_name is None else image_name
+
+    # Configuration
+    if model_type == "body":
+        ModelClass = BodyNetwork
+        DatasetClass = SynthBodyDataset
+        data_path = "data/synth_body"
+        ckpt_dir = "experiments/checkpoints/body"
+        backbone = "hrnet_w48"
+        target_size = 256
+    else:  # hand
+        ModelClass = HandNetwork
+        DatasetClass = SynthHandDataset
+        data_path = "data/synth_hand"
+        ckpt_dir = "experiments/checkpoints/hand"
+        backbone = "hrnet_w18"
+        target_size = 128
+
     # Load Model
-    print("Loading model...")
-    model = HMRBodyNetwork(backbone_name="hrnet_w48", pretrained=False).to(DEVICE)
+    print(f"Loading {model_type} model...")
+    model = ModelClass(backbone_name=backbone, pretrained=False).to(DEVICE)
 
     # Finds the latest checkpoint
-    checkpoints = glob.glob("experiments/checkpoints/model_epoch_*.pth")
+    checkpoints = glob.glob(f"{ckpt_dir}/model_epoch_*.pth")
     if not checkpoints:
-        print("No checkpoints found in experiments/checkpoints/")
+        print(f"No checkpoints found in {ckpt_dir}/")
         return
 
     # Sort by epoch number
-    latest_ckpt = sorted(
-        checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0])
-    )[-1]
+    def get_epoch(ckpt_path):
+        return int(ckpt_path.split("_")[-1].split(".")[0])
+
+    latest_ckpt = max(checkpoints, key=get_epoch)
     print(f"Loading checkpoint: {latest_ckpt}")
 
     checkpoint = torch.load(latest_ckpt, map_location=DEVICE)
+
+    # Sanitize checkpoint keys (remove _orig_mod prefix from torch.compile)
+    new_ckpt = {}
+    for k, v in checkpoint.items():
+        new_k = k.replace("_orig_mod.", "")
+        new_ckpt[new_k] = v
+    checkpoint = new_ckpt
+
     model.load_state_dict(checkpoint)
     model.eval()
 
     # Load Dataset & Sample
     print("Loading dataset sample...")
-    dataset = SynthBodyDataset(
-        "data/synth_body", target_size=256, is_train=False, specific_image=image_name
+    dataset = DatasetClass(
+        data_path, target_size=target_size, is_train=False, specific_image=image_name
     )
 
     # Pick a random sample if an image name is not specified
@@ -99,18 +131,23 @@ def run_inference(image_name=None):
     original_img_bgr = cv2.imread(img_path)
 
     # Original Intrinsics (Uncropped)
+    # Check if 'camera_to_image' is list or np (json load makes it list)
     original_K = np.array(meta["camera"]["camera_to_image"], dtype=np.float32)
     # -----------------------------------------------------------
 
     raw_img = sample["image"].to(DEVICE).float() / 255.0
     norm_img = TF.normalize(
         raw_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    ).unsqueeze(0)  # Add batch dim [1, 3, 256, 256]
+    ).unsqueeze(0)  # Add batch dim
 
     # Run Inference
     print("Running inference...")
     with torch.no_grad():
-        p_pose, p_shape, p_ldmk = model(norm_img)
+        if model_type == "body":
+            p_pose, p_shape, p_ldmk = model(norm_img)
+        else:
+            p_pose, p_ldmk = model(norm_img)
+            p_shape = None
 
     # Visualize
     print("Visualizing...")
@@ -124,11 +161,18 @@ def run_inference(image_name=None):
     gt_pose = sample["pose"].unsqueeze(0).to(DEVICE)  # [1, 52, 3] Axis Angle
     gt_rotmat = batch_rodrigues(gt_pose.view(1, 52, 3))  # [1, 52, 3, 3]
 
-    p_pose_single = p_pose.float()  # [1, 21, 6]
-    p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))  # [1, 21, 3, 3]
+    if model_type == "body":
+        p_pose_single = p_pose.float()  # [1, 21, 6]
+        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 21, 6))  # [1, 21, 3, 3]
 
-    full_rotmat = gt_rotmat.clone()
-    full_rotmat[0, 1:22] = p_rotmat[0]  # Overwrite body joints
+        full_rotmat = gt_rotmat.clone()
+        full_rotmat[0, 1:22] = p_rotmat[0]  # Overwrite body joints
+    else:  # hand
+        p_pose_single = p_pose.float()  # [1, 15, 6]
+        p_rotmat = rotation_6d_to_matrix(p_pose_single.view(1, 15, 6))  # [1, 15, 3, 3]
+
+        full_rotmat = gt_rotmat.clone()
+        full_rotmat[0, 22:37] = p_rotmat[0]  # Overwrite LEFT hand joints
 
     # Convert back to Axis-Angle for draw_mesh
     rots_np = full_rotmat[0].cpu().numpy()
@@ -148,9 +192,16 @@ def run_inference(image_name=None):
     # since this model doesn't seem to predict translation (based on train.py usage).
     gt_world_t = sample["trans"].unsqueeze(0).numpy()
 
+    # Use GT Shape for Hand if p_shape is None
+    shape_np = (
+        p_shape[0].cpu().numpy()
+        if p_shape is not None
+        else sample["betas"].cpu().numpy()
+    )
+
     vis_img = draw_mesh(
         original_img_bgr,  # Pass the detailed original image
-        p_shape[0].cpu().numpy(),
+        shape_np,
         pose_aa_flat,
         gt_world_t[0],
         cam_ext[0],
@@ -164,13 +215,16 @@ def run_inference(image_name=None):
     lm_img = original_img_bgr.copy()
 
     # 2. Get Affine Transform used for cropping (Inverse needed)
-    M = get_affine_transform(meta, target_size=256)
+    M = get_affine_transform(meta, target_size=target_size)
 
     # 3. Process Landmarks
-    # p_ldmk is [1, 1378, 3] (x, y, log_var)
+    # p_ldmk is [1, N, 3] (x, y, log_var)
     # x,y are normalized [0, 1] in crop space.
     pred_ldmk_cpu = p_ldmk[0].cpu().numpy()
 
+    # NOTE: Training loss hardcodes a scalar of 256.0 for both Body and Hand models.
+    # Even though Hand uses 128x128 resolution, the model learned to map to 256.0 scale.
+    # We must use 256.0 here to recover the correct pixel coordinates in the crop.
     pts_crop = pred_ldmk_cpu[:, :2] * 256.0  # Scale to crop pixels [N, 2]
     log_var = pred_ldmk_cpu[:, 2]
 
@@ -230,4 +284,11 @@ def run_inference(image_name=None):
 
 
 if __name__ == "__main__":
-    run_inference(image_name="img_0000000_001.jpg")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--type", type=str, default="body", choices=["body", "hand"], help="Model type"
+    )
+    parser.add_argument("--image", type=str, default=None, help="Specific image name")
+    args = parser.parse_args()
+
+    run_inference(args)
