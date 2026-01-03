@@ -222,9 +222,15 @@ def train(args):
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE)
-        # Handle state dict (remove 'module.' if saved from DDP but loaded here)
-        # Our save logic is simple model.state_dict(), so direct load is fine.
-        model.load_state_dict(checkpoint)
+
+        # Sanitize Checkpoint Keys (remove _orig_mod prefix if present)
+        state_dict = checkpoint
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("_orig_mod.", "")
+            new_state_dict[new_key] = v
+
+        model.load_state_dict(new_state_dict)
 
         # Infer epoch from filename "model_epoch_N.pth"
         try:
