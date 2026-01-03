@@ -216,7 +216,6 @@ def train(args):
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args_epochs)
 
     start_epoch = 1
     if args.resume:
@@ -239,17 +238,16 @@ def train(args):
             start_epoch = int(fname.split("_")[-1].split(".")[0]) + 1
             print(f"Inferred start epoch: {start_epoch}")
 
-            # Fast-forward scheduler
-            # Note: This is an approximation. Ideally we load optimizer state too.
-            # But for simple extension, this ensures LR follows the Cosine curve of the NEW total epochs.
-            # If we want to strictly continue the OLD schedule, T_max should handle it.
-            # User wants to EXTEND to 400. So we want T_max=400.
-            for _ in range(start_epoch - 1):
-                scheduler.step()
-
         except Exception as e:
             print(f"Could not infer start epoch from filename: {e}")
             print("Starting from epoch 1 (with loaded weights).")
+
+    # Initialize scheduler with correct start epoch
+    # last_epoch=start_epoch-2 because PyTorch is 0-indexed and increments on step()
+    # If start_epoch=1, last_epoch=-1 (default)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args_epochs, last_epoch=start_epoch - 2
+    )
 
     if cfg.get("is_roi"):
         criterion = cfg["loss_cls"]()
