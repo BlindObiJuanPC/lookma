@@ -290,3 +290,27 @@ class HandLoss(nn.Module):
             },
             pred_joints_2d,
         )
+
+
+class BodyRoiLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_ldmk, gt_ldmk):
+        """
+        Args:
+            pred_ldmk: [B, N, 3] (x, y normalized [0,1], log_var)
+            gt_ldmk: [B, N, 2] (x, y normalized [0,1])
+        """
+        target_size = 256.0
+
+        # Scale to pixel space for loss computation
+        pred_xy = pred_ldmk[..., :2] * target_size
+        gt_xy = gt_ldmk * target_size
+
+        pred_log_var = torch.clamp(pred_ldmk[..., 2], -10.0, 10.0)
+
+        dist_sq = (pred_xy - gt_xy).pow(2).sum(dim=-1)
+
+        loss = (torch.exp(-pred_log_var) * dist_sq + pred_log_var) * 0.5
+        return loss.mean()
