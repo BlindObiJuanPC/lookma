@@ -80,8 +80,10 @@ def save_roi_debug_image(image_tensor, pred_ldmk, gt_ldmk, epoch, batch_idx):
 
         # Draw Prediction with Confidence Coloring
         # Green (Confident) -> Red (Unconfident)
-        # Assumed log_var range: -10 (very confident) to -2 (very uncertain)
-        min_lv, max_lv = -10.0, -2.0
+        # Derived from s = ln(d^2):
+        # -2.0 ~= 0.36px error (Green)
+        # 3.5 ~= 5.75px error (Red)
+        min_lv, max_lv = -2.0, 3.5
 
         for i in range(pred_ldmk.shape[1]):
             x = int(pred_ldmk[0, i, 0] * img_bgr.shape[1])
@@ -177,11 +179,13 @@ def save_debug_image(
 def train(args):
     cfg = CONFIGS[args.type]
 
+    args_epochs = args.epochs if args.epochs else cfg["epochs"]
     if not args.explain:
         print(
             f"RUNNING {args.type.upper()} TRAINING | "
             f"Batch: {cfg['batch_size']} | "
-            f"Eff: {cfg['batch_size'] * cfg['acc_steps']}"
+            f"Eff: {cfg['batch_size'] * cfg['acc_steps']} | "
+            f"Epochs: {args_epochs}"
         )
 
     # Checkpoint Dir
@@ -212,9 +216,35 @@ def train(args):
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg["epochs"]
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args_epochs)
+
+    start_epoch = 1
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=DEVICE)
+        # Handle state dict (remove 'module.' if saved from DDP but loaded here)
+        # Our save logic is simple model.state_dict(), so direct load is fine.
+        model.load_state_dict(checkpoint)
+
+        # Infer epoch from filename "model_epoch_N.pth"
+        try:
+            fname = os.path.basename(args.resume)
+            # expected: model_epoch_200.pth
+            start_epoch = int(fname.split("_")[-1].split(".")[0]) + 1
+            print(f"Inferred start epoch: {start_epoch}")
+
+            # Fast-forward scheduler
+            # Note: This is an approximation. Ideally we load optimizer state too.
+            # But for simple extension, this ensures LR follows the Cosine curve of the NEW total epochs.
+            # If we want to strictly continue the OLD schedule, T_max should handle it.
+            # User wants to EXTEND to 400. So we want T_max=400.
+            for _ in range(start_epoch - 1):
+                scheduler.step()
+
+        except Exception as e:
+            print(f"Could not infer start epoch from filename: {e}")
+            print("Starting from epoch 1 (with loaded weights).")
+
     if cfg.get("is_roi"):
         criterion = cfg["loss_cls"]()
     else:
@@ -230,7 +260,7 @@ def train(args):
     save_interval = 1
     vis_interval = 500
 
-    for epoch in range(1, cfg["epochs"] + 1):
+    for epoch in range(start_epoch, args_epochs + 1):
         model.train()
         total_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
@@ -244,7 +274,7 @@ def train(args):
             )
             print(f"DEBUG: Epoch 1 (Frozen) Trainable Params: {num_trainable:,}")
 
-        if epoch == 2:  # Full train
+        if epoch == 2 or (args.resume and epoch == start_epoch):  # Full train or Resume
             print("Unfreezing Backbone...")
             # Handle compiled model wrapper if present
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -256,8 +286,12 @@ def train(args):
                 raw_model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=True
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=cfg["epochs"] - 1
+                optimizer, T_max=args_epochs - 1
             )
+            # Fast forward scheduler for resume
+            if args.resume and epoch > 2:
+                for _ in range(epoch - 1):
+                    scheduler.step()
 
             # FORCE RE-COMPILE to ensure the graph respects the new requires_grad=True
             if args.compile and not args.explain:
@@ -415,6 +449,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dry_run", action="store_true", help="Run a single batch for debugging"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None, help="Override total number of epochs"
     )
     args = parser.parse_args()
 
