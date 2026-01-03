@@ -283,7 +283,7 @@ def train(args):
             )
             print(f"DEBUG: Epoch 1 (Frozen) Trainable Params: {num_trainable:,}")
 
-        if epoch == 2 or (args.resume and epoch == start_epoch):  # Full train or Resume
+        if epoch == 2:  # Full train
             print("Unfreezing Backbone...")
             # Handle compiled model wrapper if present
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
