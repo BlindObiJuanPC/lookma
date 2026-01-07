@@ -5,6 +5,9 @@ import torchvision.transforms.functional as TF
 from lookma.models import BodyRoiNetwork
 
 
+import concurrent.futures
+
+
 class ROIFinder:
     def __init__(self, model_path, device=None):
         self.device = (
@@ -23,26 +26,31 @@ class ROIFinder:
         self.model.to(self.device)
         self.model.eval()
 
+        # Thread pool for preprocessing
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
         self.min_lv = 0.0
         self.max_lv = 12.0
 
+    def _process_single_crop(self, img):
+        # Resize
+        img_resized = cv2.resize(img, (256, 256))
+        # BGR -> RGB
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+
+        t_img = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+        t_img = TF.normalize(
+            t_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        return t_img
+
     def preprocess_batch(self, crops):
-        """Converts a list of BGR crops to a normalized tensor batch."""
-        tensors = []
-        for img in crops:
-            # Resize
-            img_resized = cv2.resize(img, (256, 256))
-            # BGR -> RGB
-            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-
-            t_img = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-            t_img = TF.normalize(
-                t_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )
-            tensors.append(t_img)
-
-        if not tensors:
+        """Converts a list of BGR crops to a normalized tensor batch using threads."""
+        if not crops:
             return None
+
+        # Use thread pool to speed up resize/convert
+        tensors = list(self.executor.map(self._process_single_crop, crops))
 
         return torch.stack(tensors).to(self.device)
 
@@ -51,6 +59,7 @@ class ROIFinder:
         if not crops:
             return None, None
 
+        # preprocess_batch now handles threading
         full_batch = self.preprocess_batch(crops)
         num_items = full_batch.shape[0]
         preds_list = []
@@ -127,24 +136,33 @@ class ROIFinder:
         if not available_sizes:
             available_sizes = [min(h, w)]
 
+        # 1. Flatten all windows first
+        all_metadata = []  # (size_idx, win_tuple)
+        for idx, size in enumerate(available_sizes):
+            wins = self.generate_windows((h, w), size, stride_ratio)
+            for win in wins:
+                all_metadata.append((idx, win))
+
+        total_windows = len(all_metadata)
         best_score = -1.0
         best_rect = None
         best_landmarks = None
         best_size_idx = 0
 
-        total_steps = len(available_sizes)
+        # 2. Process in chunks
+        chunk_size = 64
 
-        for i, size in enumerate(available_sizes):
+        for i in range(0, total_windows, chunk_size):
             if progress_callback:
-                progress_callback(i, total_steps)
+                progress_callback(i, total_windows)
 
-            windows = self.generate_windows((h, w), size, stride_ratio)
+            chunk_meta = all_metadata[i : i + chunk_size]
 
-            # Extract Crops
+            # Extract Crops for this chunk
             crops = []
-            valid_windows = []
+            valid_indices = []  # Indices within the chunk that are valid
 
-            for x, y, win_w, win_h in windows:
+            for k, (s_idx, (x, y, win_w, win_h)) in enumerate(chunk_meta):
                 x1, y1 = x, y
                 x2, y2 = x + win_w, y + win_h
                 ix1, iy1 = max(0, x1), max(0, y1)
@@ -157,13 +175,13 @@ class ROIFinder:
                     cx2, cy2 = cx1 + (ix2 - ix1), cy1 + (iy2 - iy1)
                     crop_canvas[cy1:cy2, cx1:cx2] = roi
                     crops.append(crop_canvas)
-                    valid_windows.append((x, y, win_w, win_h))
+                    valid_indices.append(k)
 
             if not crops:
                 continue
 
             # Predict
-            preds, scores = self.predict_batch(crops)
+            preds, scores = self.predict_batch(crops, batch_size=chunk_size)
 
             # Find best in this batch
             if scores.size > 0:
@@ -172,8 +190,12 @@ class ROIFinder:
 
                 if batch_best_score > best_score:
                     best_score = batch_best_score
-                    best_rect = valid_windows[batch_best_idx]
+                    # Map back to metadata
+                    valid_k = valid_indices[batch_best_idx]
+                    s_idx, rect = chunk_meta[valid_k]
+
+                    best_size_idx = s_idx
+                    best_rect = rect
                     best_landmarks = preds[batch_best_idx]
-                    best_size_idx = i
 
         return best_rect, best_score, best_landmarks, best_size_idx

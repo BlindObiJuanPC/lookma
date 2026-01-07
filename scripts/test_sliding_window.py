@@ -57,9 +57,12 @@ class WindowVisualizer:
         # --- AUTO SCAN FOR BEST WINDOW (Using ROIFinder) ---
         print("\nScanning for best initialization window...")
 
-        pbar = tqdm(desc="Scanning Levels")
+        pbar = tqdm(desc="Scanning Windows")
 
         def pbar_callback(curr, total):
+            # Debug: print raw values
+            if curr == 0:
+                print(f" DEBUG: Total Windows to Scan: {total}")
             pbar.total = total
             pbar.n = curr + 1
             pbar.refresh()
@@ -67,7 +70,7 @@ class WindowVisualizer:
         best_rect, best_score, _, best_size_idx = self.roi_finder.find_best_roi(
             self.original_img,
             min_size=self.min_win_size,
-            stride_ratio=0.10,  # Scan stride
+            stride_ratio=0.20,  # Scan stride (faster)
             scale_factor=self.scale_factor,
             start_with_max=self.start_with_max,
             progress_callback=pbar_callback,
