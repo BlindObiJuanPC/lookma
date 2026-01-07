@@ -18,7 +18,7 @@ ROI_CHECKPOINT = "experiments/checkpoints/roi/model_epoch_600.pth"
 
 
 class WindowVisualizer:
-    def __init__(self, img_path, stride_ratio=0.10):
+    def __init__(self, img_path, stride_ratio=0.25):
         if not os.path.exists(img_path):
             raise FileNotFoundError(f"Image not found at {img_path}")
 
@@ -55,23 +55,66 @@ class WindowVisualizer:
         curr = float(min(self.h, self.w))
         while curr >= self.min_win_size:
             self.available_sizes.append(int(curr))
-            curr *= 0.90
+            curr *= 0.75
 
         if not self.available_sizes:
             self.available_sizes = [min(self.h, self.w)]
 
         # --- AUTO SCAN FOR BEST WINDOW ---
         print("\nScanning for best initialization window...")
-        best_size_idx, best_win_idx, best_score = self.scan_for_best_window()
-        print(
-            f"Match Found! Size Level: {best_size_idx}, Index: {best_win_idx}, Score: {best_score:.4f}\n"
-        )
+        best_size_idx, _, best_score = self.scan_for_best_window()
+        print(f"Best Size Level Found: {best_size_idx} (Score: {best_score:.4f})")
 
         # State
         self.size_idx = best_size_idx
         self.current_size = self.available_sizes[self.size_idx]
-        self.current_idx = best_win_idx
-        self.windows = []
+
+        # Generate windows for the ACTUAL session stride
+        self.windows = self._make_windows(self.current_size, self.stride_ratio)
+
+        # --- RESCORE ACTUAL GRID ---
+        print(
+            f"Rescoring {len(self.windows)} windows at current stride ({self.stride_ratio * 100:.0f}%)..."
+        )
+
+        # Prepare crops for grid
+        grid_crops = []
+        for x, y, w, h in self.windows:
+            x1, y1 = x, y
+            x2, y2 = x + w, y + h
+            ix1, iy1 = max(0, x1), max(0, y1)
+            ix2, iy2 = min(self.w, x2), min(self.h, y2)
+
+            if ix2 > ix1 and iy2 > iy1:
+                roi = self.original_img[iy1:iy2, ix1:ix2]
+                crop_canvas = np.zeros((h, w, 3), dtype=np.uint8) + 128
+                cx1, cy1 = ix1 - x1, iy1 - y1
+                cx2, cy2 = cx1 + (ix2 - ix1), cy1 + (iy2 - iy1)
+                crop_canvas[cy1:cy2, cx1:cx2] = roi
+                crop = crop_canvas
+            else:
+                crop = np.zeros((h, w, 3), dtype=np.uint8)
+            grid_crops.append(crop)
+
+        # Run Inference on Actual Grid
+        preds = self.run_inference(grid_crops)
+
+        best_match_idx = 0
+        best_grid_score = -1.0
+        min_lv, max_lv = 0.0, 12.0
+
+        for k, ldmks_raw in enumerate(preds):
+            avg_log_var = np.mean(ldmks_raw[:, 2])
+            t_avg = (avg_log_var - min_lv) / (max_lv - min_lv)
+            conf_score = 1.0 - max(0.0, min(1.0, t_avg))
+
+            if conf_score > best_grid_score:
+                best_grid_score = conf_score
+                best_match_idx = k
+
+        print(f"Best Grid Index: {best_match_idx} (Score: {best_grid_score:.4f})\n")
+
+        self.current_idx = best_match_idx
         self.initialized = False
 
         # Update State
@@ -90,8 +133,8 @@ class WindowVisualizer:
                 if hasattr(user32, "GetKeyState"):
                     self.mouse_check_func = user32.GetKeyState
                     print("Mouse detection enabled: using GetKeyState.")
-                elif hasattr(user32, "GetGetAsyncKeyState"):
-                    self.mouse_check_func = user32.GetGetAsyncKeyState
+                elif hasattr(user32, "GetAsyncKeyState"):
+                    self.mouse_check_func = user32.GetAsyncKeyState
                     print("Mouse detection enabled: using GetAsyncKeyState.")
                 else:
                     print("Mouse detection functions not found. Using timer fallback.")
@@ -140,17 +183,17 @@ class WindowVisualizer:
                 print(f"Failed to set trackbar position: {e}")
 
     def scan_for_best_window(self):
-        """Scans all size levels (>=64px) with 10% stride to find max confidence."""
+        """Scans all size levels (>=256px) with 10% stride to find max confidence."""
         best_score = -1.0
         best_size_idx = 0
-        best_win_idx = 0
+        best_rect = None
 
         # Use a fixed stride for scanning as requested (10%)
         scan_stride = 0.10
         min_lv, max_lv = 0.0, 12.0
 
-        # Filter levels >= 64
-        valid_indices = [i for i, s in enumerate(self.available_sizes) if s >= 64]
+        # Filter levels >= 256
+        valid_indices = [i for i, s in enumerate(self.available_sizes) if s >= 256]
 
         for idx in tqdm(valid_indices, desc="Scanning Levels"):
             size = self.available_sizes[idx]
@@ -175,35 +218,27 @@ class WindowVisualizer:
                     crop = np.zeros((h, w, 3), dtype=np.uint8)
                 crop_list.append(crop)
 
-            # Run Inference in Batches (to avoid OOM on huge grids)
-            batch_size = 64
-            num_crops = len(crop_list)
-
-            if num_crops == 0:
+            if not crop_list:
                 continue
 
-            # Simple batch loop
-            for b_start in range(0, num_crops, batch_size):
-                b_end = min(b_start + batch_size, num_crops)
-                batch_crops = crop_list[b_start:b_end]
+            # Run Inference (Internal Batching)
+            preds = self.run_inference(crop_list)
 
-                preds = self.run_inference(batch_crops)  # [B, 36, 3]
+            # Calculate scores
+            for lp, ldmks_raw in enumerate(preds):
+                # log_var is index 2
+                avg_log_var = np.mean(ldmks_raw[:, 2])
 
-                # Calculate scores
-                for lp, ldmks_raw in enumerate(preds):
-                    # log_var is index 2
-                    avg_log_var = np.mean(ldmks_raw[:, 2])
+                # Compute score based on our formula
+                t_avg = (avg_log_var - min_lv) / (max_lv - min_lv)
+                conf_score = 1.0 - max(0.0, min(1.0, t_avg))
 
-                    # Compute score based on our formula
-                    t_avg = (avg_log_var - min_lv) / (max_lv - min_lv)
-                    conf_score = 1.0 - max(0.0, min(1.0, t_avg))
+                if conf_score > best_score:
+                    best_score = conf_score
+                    best_size_idx = idx
+                    best_rect = windows[lp]
 
-                    if conf_score > best_score:
-                        best_score = conf_score
-                        best_size_idx = idx
-                        best_win_idx = b_start + lp
-
-        return best_size_idx, best_win_idx, best_score
+        return best_size_idx, best_rect, best_score
 
     def _make_windows(self, size, stride_ratio):
         """Helper to generate window rects without affecting state."""
@@ -266,30 +301,37 @@ class WindowVisualizer:
                 pass
 
     def run_inference(self, crop_list):
-        """Run batch inference."""
+        """Run batch inference with internal chunking."""
         if not crop_list:
             return None
 
+        # Pre-process all
         tensors = []
         for img in crop_list:
-            # Resize
             img_resized = cv2.resize(img, (256, 256))
-
-            # Convert BGR to RGB
             img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-
             t_img = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
             t_img = TF.normalize(
                 t_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             )
             tensors.append(t_img)
 
-        batch = torch.stack(tensors).to(DEVICE)
+        full_batch = torch.stack(tensors)
+
+        # Process in chunks of 64
+        batch_size = 64
+        num_items = full_batch.shape[0]
+        preds_list = []
 
         with torch.no_grad():
-            preds = self.model(batch)
+            for i in range(0, num_items, batch_size):
+                b_inputs = full_batch[i : i + batch_size].to(DEVICE)
+                b_preds = self.model(b_inputs)
+                preds_list.append(b_preds.cpu())
 
-        return preds.cpu().numpy()
+        # Cat and return numpy
+        all_preds = torch.cat(preds_list, dim=0)
+        return all_preds.numpy()
 
     def generate_grid(self):
         """Generates the base grid image with inference results."""
@@ -609,10 +651,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--image",
         type=str,
-        default="data/images/jordan-pants-toe-touch.png",
+        default="data/images/jordan-pants-jumping-jacks.png",
         help="Path to test image",
     )
-    parser.add_argument("--stride", type=float, default=0.10, help="Stride ratio")
+    parser.add_argument("--stride", type=float, default=0.25, help="Stride ratio")
 
     args = parser.parse_args()
     main(args)
