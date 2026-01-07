@@ -52,7 +52,7 @@ class WindowVisualizer:
 
         # Pre-calculate Window Sizes (Logarithmic: Max * 0.9^k)
         self.available_sizes = []
-        curr = float(min(self.h, self.w))
+        curr = float(max(self.h, self.w))
         while curr >= self.min_win_size:
             self.available_sizes.append(int(curr))
             curr *= 0.75
