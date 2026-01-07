@@ -21,7 +21,7 @@ ROI_CHECKPOINT = "experiments/checkpoints/roi/model_epoch_600.pth"
 
 
 class WindowVisualizer:
-    def __init__(self, img_path, stride_ratio=0.25):
+    def __init__(self, img_path, stride_ratio=0.10):
         if not os.path.exists(img_path):
             raise FileNotFoundError(f"Image not found at {img_path}")
 
@@ -40,7 +40,7 @@ class WindowVisualizer:
         self.window_name = "Interactive Sliding Window"
         self.max_disp_size = 1200
         self.min_win_size = 256
-        self.scale_factor = 0.75
+        self.scale_factor = 0.90
         self.start_with_max = True
 
         # Replicate size logic for GUI
@@ -581,7 +581,7 @@ if __name__ == "__main__":
         default="data/images/jordan-pants-jumping-jacks.png",
         help="Path to test image",
     )
-    parser.add_argument("--stride", type=float, default=0.25, help="Stride ratio")
+    parser.add_argument("--stride", type=float, default=0.10, help="Stride ratio")
 
     args = parser.parse_args()
     main(args)

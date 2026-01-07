@@ -96,7 +96,7 @@ class ROIFinder:
         image,
         min_size=256,
         stride_ratio=0.10,
-        scale_factor=0.75,
+        scale_factor=0.90,
         start_with_max=True,
         progress_callback=None,
     ):
