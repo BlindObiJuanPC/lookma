@@ -1,5 +1,9 @@
 import argparse
 import os
+import sys
+
+# robust import path
+sys.path.append(os.getcwd())
 
 import ctypes
 import time
@@ -7,10 +11,9 @@ import time
 import cv2
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
-from lookma.models import BodyRoiNetwork
+from lookma.roi import ROIFinder
 
 # Constants
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -29,41 +32,48 @@ class WindowVisualizer:
         self.h, self.w = self.original_img.shape[:2]
         self.stride_ratio = stride_ratio
 
-        # Load Model
-        print(f"Loading model from {ROI_CHECKPOINT}...")
-        self.model = BodyRoiNetwork(backbone_name="resnet18", pretrained=False)
-        if os.path.exists(ROI_CHECKPOINT):
-            ckpt = torch.load(ROI_CHECKPOINT, map_location=DEVICE)
-            # Sanitize keys
-            new_ckpt = {}
-            for k, v in ckpt.items():
-                new_ckpt[k.replace("_orig_mod.", "")] = v
-            self.model.load_state_dict(new_ckpt)
-        else:
-            print("WARNING: Checkpoint not found! Inference will be random.")
-
-        self.model.to(DEVICE)
-        self.model.eval()
+        # Initialize ROIFinder
+        print(f"Loading ROIFinder with model: {ROI_CHECKPOINT}")
+        self.roi_finder = ROIFinder(ROI_CHECKPOINT, device=DEVICE)
 
         # Display Config
         self.window_name = "Interactive Sliding Window"
         self.max_disp_size = 1200
         self.min_win_size = 256
+        self.scale_factor = 0.75
+        self.start_with_max = True
 
-        # Pre-calculate Window Sizes (Logarithmic: Max * 0.9^k)
+        # Replicate size logic for GUI
         self.available_sizes = []
-        curr = float(max(self.h, self.w))
+        curr = float(
+            max(self.h, self.w) if self.start_with_max else min(self.h, self.w)
+        )
         while curr >= self.min_win_size:
             self.available_sizes.append(int(curr))
-            curr *= 0.75
-
+            curr *= self.scale_factor
         if not self.available_sizes:
             self.available_sizes = [min(self.h, self.w)]
 
-        # --- AUTO SCAN FOR BEST WINDOW ---
+        # --- AUTO SCAN FOR BEST WINDOW (Using ROIFinder) ---
         print("\nScanning for best initialization window...")
-        best_size_idx, _, best_score = self.scan_for_best_window()
-        print(f"Best Size Level Found: {best_size_idx} (Score: {best_score:.4f})")
+
+        pbar = tqdm(desc="Scanning Levels")
+
+        def pbar_callback(curr, total):
+            pbar.total = total
+            pbar.n = curr + 1
+            pbar.refresh()
+
+        best_rect, best_score, _, best_size_idx = self.roi_finder.find_best_roi(
+            self.original_img,
+            min_size=self.min_win_size,
+            stride_ratio=0.10,  # Scan stride
+            scale_factor=self.scale_factor,
+            start_with_max=self.start_with_max,
+            progress_callback=pbar_callback,
+        )
+        pbar.close()
+        print(f"\nBest Size Level Found: {best_size_idx} (Score: {best_score:.4f})")
 
         # State
         self.size_idx = best_size_idx
@@ -96,7 +106,7 @@ class WindowVisualizer:
                 crop = np.zeros((h, w, 3), dtype=np.uint8)
             grid_crops.append(crop)
 
-        # Run Inference on Actual Grid
+        # Run Inference
         preds = self.run_inference(grid_crops)
 
         best_match_idx = 0
@@ -183,62 +193,8 @@ class WindowVisualizer:
                 print(f"Failed to set trackbar position: {e}")
 
     def scan_for_best_window(self):
-        """Scans all size levels (>=256px) with 10% stride to find max confidence."""
-        best_score = -1.0
-        best_size_idx = 0
-        best_rect = None
-
-        # Use a fixed stride for scanning as requested (10%)
-        scan_stride = 0.10
-        min_lv, max_lv = 0.0, 12.0
-
-        # Filter levels >= 256
-        valid_indices = [i for i, s in enumerate(self.available_sizes) if s >= 256]
-
-        for idx in tqdm(valid_indices, desc="Scanning Levels"):
-            size = self.available_sizes[idx]
-            windows = self._make_windows(size, scan_stride)
-
-            # Prepare Crops
-            crop_list = []
-            for x, y, w, h in windows:
-                x1, y1 = x, y
-                x2, y2 = x + w, y + h
-                ix1, iy1 = max(0, x1), max(0, y1)
-                ix2, iy2 = min(self.w, x2), min(self.h, y2)
-
-                if ix2 > ix1 and iy2 > iy1:
-                    roi = self.original_img[iy1:iy2, ix1:ix2]
-                    crop_canvas = np.zeros((h, w, 3), dtype=np.uint8) + 128
-                    cx1, cy1 = ix1 - x1, iy1 - y1
-                    cx2, cy2 = cx1 + (ix2 - ix1), cy1 + (iy2 - iy1)
-                    crop_canvas[cy1:cy2, cx1:cx2] = roi
-                    crop = crop_canvas
-                else:
-                    crop = np.zeros((h, w, 3), dtype=np.uint8)
-                crop_list.append(crop)
-
-            if not crop_list:
-                continue
-
-            # Run Inference (Internal Batching)
-            preds = self.run_inference(crop_list)
-
-            # Calculate scores
-            for lp, ldmks_raw in enumerate(preds):
-                # log_var is index 2
-                avg_log_var = np.mean(ldmks_raw[:, 2])
-
-                # Compute score based on our formula
-                t_avg = (avg_log_var - min_lv) / (max_lv - min_lv)
-                conf_score = 1.0 - max(0.0, min(1.0, t_avg))
-
-                if conf_score > best_score:
-                    best_score = conf_score
-                    best_size_idx = idx
-                    best_rect = windows[lp]
-
-        return best_size_idx, best_rect, best_score
+        # Deprecated: Logic moved to ROIFinder, this method is no longer used but if called could just error or proxy
+        pass
 
     def _make_windows(self, size, stride_ratio):
         """Helper to generate window rects without affecting state."""
@@ -296,42 +252,13 @@ class WindowVisualizer:
                 cv2.setTrackbarMax("Index", self.window_name, new_max)
                 if self.current_idx > new_max:
                     self.current_idx = 0
-                cv2.setTrackbarPos("Index", self.window_name, self.current_idx)
             except cv2.error:
                 pass
 
     def run_inference(self, crop_list):
-        """Run batch inference with internal chunking."""
-        if not crop_list:
-            return None
-
-        # Pre-process all
-        tensors = []
-        for img in crop_list:
-            img_resized = cv2.resize(img, (256, 256))
-            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-            t_img = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-            t_img = TF.normalize(
-                t_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )
-            tensors.append(t_img)
-
-        full_batch = torch.stack(tensors)
-
-        # Process in chunks of 64
-        batch_size = 64
-        num_items = full_batch.shape[0]
-        preds_list = []
-
-        with torch.no_grad():
-            for i in range(0, num_items, batch_size):
-                b_inputs = full_batch[i : i + batch_size].to(DEVICE)
-                b_preds = self.model(b_inputs)
-                preds_list.append(b_preds.cpu())
-
-        # Cat and return numpy
-        all_preds = torch.cat(preds_list, dim=0)
-        return all_preds.numpy()
+        """Run batch inference using ROIFinder."""
+        preds, _ = self.roi_finder.predict_batch(crop_list)
+        return preds
 
     def generate_grid(self):
         """Generates the base grid image with inference results."""
