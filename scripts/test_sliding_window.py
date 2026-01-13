@@ -40,7 +40,7 @@ class WindowVisualizer:
         self.window_name = "Interactive Sliding Window"
         self.max_disp_size = 1200
         self.min_win_size = 256
-        self.scale_factor = 0.90
+        self.scale_factor = 0.80
         self.start_with_max = True
 
         # Replicate size logic for GUI
@@ -73,7 +73,7 @@ class WindowVisualizer:
             self.roi_finder.find_best_roi(
                 self.original_img,
                 min_size=self.min_win_size,
-                stride_ratio=0.10,  # Scan stride
+                stride_ratio=self.stride_ratio,  # Scan stride
                 scale_factor=self.scale_factor,
                 start_with_max=self.start_with_max,
                 progress_callback=pbar_callback,
@@ -218,6 +218,8 @@ class WindowVisualizer:
             )
 
             # Fine Info
+            dx = refined_rect[0] - coarse_rect[0]
+            dy = refined_rect[1] - coarse_rect[1]
             cv2.putText(
                 comp_vis,
                 "REFINED RESULT",
@@ -245,6 +247,15 @@ class WindowVisualizer:
                 white,
                 1,
             )
+            cv2.putText(
+                comp_vis,
+                f"Shift: dX={dx}, dY={dy}",
+                (720, 475),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                1,
+            )
 
             cv2.imshow("Refinement Comparison", comp_vis)
             cv2.waitKey(1)
@@ -253,15 +264,27 @@ class WindowVisualizer:
             best_rect = refined_rect
 
         # State
-        if best_rect is not None:
-            # Snap to closest available size level
-            refined_w = best_rect[2]
-            diffs = [abs(s - refined_w) for s in self.available_sizes]
-            self.size_idx = int(np.argmin(diffs))
-        else:
-            self.size_idx = best_size_idx
-
+        # Revert to Coarse Size Level to match the "Coarse Match" score visualization
+        self.size_idx = best_size_idx
         self.current_size = self.available_sizes[self.size_idx]
+
+        # Generate windows for the ACTUAL session stride
+        self.windows = self._make_windows(self.current_size, self.stride_ratio)
+
+        # Find the window index closest to the resulting rect (whether refined or not)
+        if best_rect is not None:
+            # Center of best_rect
+            cx, cy = best_rect[0] + best_rect[2] / 2, best_rect[1] + best_rect[3] / 2
+
+            min_dist = float("inf")
+            best_idx = 0
+            for i, (wx, wy, ww, wh) in enumerate(self.windows):
+                wcx, wcy = wx + ww / 2, wy + wh / 2
+                dist = (cx - wcx) ** 2 + (cy - wcy) ** 2
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
+            self.current_idx = best_idx
 
         # Generate windows for the ACTUAL session stride
         self.windows = self._make_windows(self.current_size, self.stride_ratio)
@@ -762,10 +785,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--image",
         type=str,
-        default="data/images/jordan-pants-turning.png",
+        default="data/images/jordan-pants-turning2.png",
         help="Path to test image",
     )
-    parser.add_argument("--stride", type=float, default=0.10, help="Stride ratio")
+    parser.add_argument("--stride", type=float, default=0.50, help="Stride ratio")
 
     args = parser.parse_args()
     main(args)
