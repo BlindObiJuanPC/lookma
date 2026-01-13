@@ -199,3 +199,59 @@ class ROIFinder:
                     best_landmarks = preds[batch_best_idx]
 
         return best_rect, best_score, best_landmarks, best_size_idx
+
+    def refine_roi(
+        self,
+        image,
+        initial_rect,
+        refine_stride=0.05,
+        refine_scale=0.95,
+        min_refine_size=128,
+        progress_callback=None,
+    ):
+        """
+        Refines the ROI by treating the initial window as the search image.
+
+        Args:
+            image: BGR numpy image.
+            initial_rect: (x, y, w, h) tuple (the "crop").
+            refine_stride: Stride for internal scan (default 0.05).
+            refine_scale: Scale factor for internal scan (default 0.95).
+            min_refine_size: Minimum window size for internal scan.
+            progress_callback: Optional func(current, total).
+
+        Returns:
+            (best_rect, best_score, best_landmarks)
+            best_rect is in global coordinates.
+        """
+        x, y, w, h = initial_rect
+        img_h, img_w = image.shape[:2]
+
+        # Enforce bounds for crop
+        cx1, cy1 = max(0, x), max(0, y)
+        cx2, cy2 = min(img_w, x + w), min(img_h, y + h)
+
+        crop = image[cy1:cy2, cx1:cx2].copy()
+
+        # We need to find the best window *within* this crop.
+        # find_best_roi scans up to max(h,w) of input.
+        # Since 'crop' is the ROI, we essentially zoom in.
+
+        sub_rect, sub_score, sub_landmarks, _ = self.find_best_roi(
+            crop,
+            min_size=min_refine_size,
+            stride_ratio=refine_stride,
+            scale_factor=refine_scale,
+            start_with_max=True,  # Search largest first (fitting the crop)
+            progress_callback=progress_callback,
+        )
+
+        if sub_rect is None:
+            # Should not happen unless crop < min_size
+            return initial_rect, -1.0, None
+
+        # Transform sub_rect back to global coords
+        sx, sy, sw, sh = sub_rect
+        global_rect = (cx1 + sx, cy1 + sy, sw, sh)
+
+        return global_rect, sub_score, sub_landmarks

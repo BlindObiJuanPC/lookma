@@ -59,6 +59,8 @@ class WindowVisualizer:
 
         pbar = tqdm(desc="Scanning Windows")
 
+        pbar = tqdm(desc="Scanning Windows")
+
         def pbar_callback(curr, total):
             # Debug: print raw values
             if curr == 0:
@@ -67,19 +69,198 @@ class WindowVisualizer:
             pbar.n = curr + 1
             pbar.refresh()
 
-        best_rect, best_score, _, best_size_idx = self.roi_finder.find_best_roi(
-            self.original_img,
-            min_size=self.min_win_size,
-            stride_ratio=0.20,  # Scan stride (faster)
-            scale_factor=self.scale_factor,
-            start_with_max=self.start_with_max,
-            progress_callback=pbar_callback,
+        best_rect, best_score, coarse_ldmks, best_size_idx = (
+            self.roi_finder.find_best_roi(
+                self.original_img,
+                min_size=self.min_win_size,
+                stride_ratio=0.10,  # Scan stride
+                scale_factor=self.scale_factor,
+                start_with_max=self.start_with_max,
+                progress_callback=pbar_callback,
+            )
         )
         pbar.close()
-        print(f"\nBest Size Level Found: {best_size_idx} (Score: {best_score:.4f})")
+        print(f"\nBest Coarse Match: {best_size_idx} (Score: {best_score:.4f})")
+
+        # --- REFINEMENT PASS ---
+        if best_rect is not None:
+            coarse_rect = best_rect
+            coarse_score = best_score
+            print("Refining window position (Hierarchical Search)...")
+
+            pbar_refine = tqdm(desc="Refining ROI")
+
+            def refine_callback(curr, total):
+                pbar_refine.total = total
+                pbar_refine.n = curr + 1
+                pbar_refine.refresh()
+
+            # Limit refinement scale to avoid deep scan (e.g. down to 80% of coarse size)
+            coarse_size = coarse_rect[2]
+            min_refine = int(coarse_size * 0.80)
+
+            refined_rect, refined_score, refined_ldmks = self.roi_finder.refine_roi(
+                self.original_img,
+                coarse_rect,
+                refine_stride=0.05,
+                refine_scale=0.95,
+                min_refine_size=min_refine,
+                progress_callback=refine_callback,
+            )
+            pbar_refine.close()
+            print(f"Refined Match Score: {refined_score:.4f}")
+
+            # --- COMPARISON VISUALIZATION ---
+            # Create a side-by-side canvas
+            disp_h, disp_w = 500, 900
+            comp_vis = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+
+            def get_crop_safe(rect):
+                rx, ry, rw, rh = rect
+                if rw <= 0 or rh <= 0:
+                    return np.zeros((10, 10, 3), dtype=np.uint8)
+
+                # Check for out of bounds (canvas logic)
+                h_img, w_img = self.original_img.shape[:2]
+
+                # If fully inside (and not negative)
+                if rx >= 0 and ry >= 0 and rx + rw <= w_img and ry + rh <= h_img:
+                    return self.original_img[ry : ry + rh, rx : rx + rw]
+
+                # Else: pad
+                pad_img = np.zeros((rh, rw, 3), dtype=np.uint8) + 128  # Gray background
+
+                # Intersection
+                x1 = max(0, rx)
+                y1 = max(0, ry)
+                x2 = min(w_img, rx + rw)
+                y2 = min(h_img, ry + rh)
+
+                if x2 > x1 and y2 > y1:
+                    src_crop = self.original_img[y1:y2, x1:x2]
+
+                    # Target coords
+                    tx1 = x1 - rx
+                    ty1 = y1 - ry
+                    tx2 = tx1 + (x2 - x1)
+                    ty2 = ty1 + (y2 - y1)
+
+                    pad_img[ty1:ty2, tx1:tx2] = src_crop
+
+                return pad_img
+
+            def draw_ldmks_on_disp(disp, ldmks):
+                if ldmks is None:
+                    return
+                h, w = disp.shape[:2]
+                min_lv, max_lv = 0.0, 12.0
+
+                for i in range(ldmks.shape[0]):
+                    lx, ly, lv = ldmks[i]
+                    px = int(lx * w)
+                    py = int(ly * h)
+
+                    # Color based on confidence (Green=High Conf, Red=Low)
+                    # Low LogVar = High Conf
+                    t = (lv - min_lv) / (max_lv - min_lv)
+                    t = max(0.0, min(1.0, t))
+
+                    # Simple Green->Red Interpolation
+                    # Low t (Low Var) -> Green (0,255,0)
+                    # High t (High Var) -> Red (0,0,255)
+                    # BGR
+                    color = (0, int(255 * (1 - t)), int(255 * t))
+                    cv2.circle(disp, (px, py), 3, color, -1)
+
+            # 1. Coarse Crop
+            c_crop = get_crop_safe(coarse_rect)
+            c_crop_disp = cv2.resize(c_crop, (400, 400))
+            draw_ldmks_on_disp(c_crop_disp, coarse_ldmks)
+            comp_vis[50:450, 25:425] = c_crop_disp
+
+            # 2. Refined Crop
+            r_crop = get_crop_safe(refined_rect)
+            r_crop_disp = cv2.resize(r_crop, (400, 400))
+            draw_ldmks_on_disp(r_crop_disp, refined_ldmks)
+            comp_vis[50:450, 475:875] = r_crop_disp
+
+            # Labels
+            green = (0, 255, 0)
+            white = (200, 200, 200)
+
+            # Coarse Info
+            cv2.putText(
+                comp_vis,
+                "COARSE RESULT",
+                (25, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                white,
+                2,
+            )
+            cv2.putText(
+                comp_vis,
+                f"Score: {coarse_score:.4f}",
+                (25, 475),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                green,
+                1,
+            )
+            cv2.putText(
+                comp_vis,
+                f"Res: {coarse_rect[2]}x{coarse_rect[3]}",
+                (25, 495),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                white,
+                1,
+            )
+
+            # Fine Info
+            cv2.putText(
+                comp_vis,
+                "REFINED RESULT",
+                (475, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                white,
+                2,
+            )
+            cv2.putText(
+                comp_vis,
+                f"Score: {refined_score:.4f}",
+                (475, 475),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                green,
+                1,
+            )
+            cv2.putText(
+                comp_vis,
+                f"Res: {refined_rect[2]}x{refined_rect[3]}",
+                (475, 495),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                white,
+                1,
+            )
+
+            cv2.imshow("Refinement Comparison", comp_vis)
+            cv2.waitKey(1)
+
+            # Update best_rect for downstream logic
+            best_rect = refined_rect
 
         # State
-        self.size_idx = best_size_idx
+        if best_rect is not None:
+            # Snap to closest available size level
+            refined_w = best_rect[2]
+            diffs = [abs(s - refined_w) for s in self.available_sizes]
+            self.size_idx = int(np.argmin(diffs))
+        else:
+            self.size_idx = best_size_idx
+
         self.current_size = self.available_sizes[self.size_idx]
 
         # Generate windows for the ACTUAL session stride
@@ -581,7 +762,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--image",
         type=str,
-        default="data/images/jordan-pants-jumping-jacks.png",
+        default="data/images/jordan-pants-turning.png",
         help="Path to test image",
     )
     parser.add_argument("--stride", type=float, default=0.10, help="Stride ratio")
